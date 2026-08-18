@@ -1,309 +1,315 @@
-import { cloneReposForPool } from "./config.js";
-import { repoIdentityFromUrl, repoUrlsEqual } from "./url.js";
-import type {
-  CooldownState,
-  LaunchIntent,
-  LaunchMode,
-  PendingRequest,
-  PlanInput,
-  PlanResult,
-  ResolvedPool,
-  SkipReason,
-  SlotSnapshot,
-} from "./types.js";
+/**
+ * Shared matching / planning for Cursor private-worker pools.
+ *
+ * This module is intentionally free of AWS and Cloudflare imports so the
+ * same functions can be unit-tested under plain node/vitest.
+ */
 
-const ACTIVE_STATUSES = new Set(["launching", "running", "suspended"]);
+import type { LaunchSpec, PendingRequest, PlannedLaunch, PoolConfig, SlotState } from "./types.js";
+import { canonicalizeUrl } from "./url.js";
 
-export function labelValue(request: PendingRequest, key: string): string | undefined {
-  return request.labels?.find((label) => label.key === key)?.value;
+/** Pending requests with no `pool` label target this pool. */
+export const DEFAULT_POOL_NAME = "default";
+
+/** Per-slot and per-request cooldown after a launch. */
+export const LAUNCH_COOLDOWN_MS = 120_000;
+
+/** How long a requestLaunchTimes entry is kept for cooldown / GC. */
+export const REQUEST_RECORD_TTL_MS = 15 * 60 * 1000;
+
+const POOL_LABEL_KEY = "pool";
+
+export function repoKeyFromOwnerName(owner: string, name: string): string {
+  return `${owner.trim().toLowerCase()}/${name.trim().toLowerCase()}`;
 }
 
-export function requestRepoUrl(request: PendingRequest): string | undefined {
-  if (request.repoUrl) {
-    return request.repoUrl;
+/**
+ * Identity used for matching: lowercase owner/name, or GitLab nested
+ * groups (`group/sub/repo`). Host is ignored so ssh / https / git@ of the
+ * same path compare equal.
+ */
+export function repoKeyFromUrl(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
   }
-  const fromLabel = labelValue(request, "repo");
-  if (fromLabel && fromLabel.includes("://")) {
-    return fromLabel;
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const scp = /^[\w.-]+@([^:/]+):(.+)$/.exec(trimmed);
+  if (scp) {
+    return pathToRepoKey(scp[2]);
+  }
+
+  try {
+    return pathToRepoKey(canonicalizeUrl(trimmed).pathname);
+  } catch {
+    if (trimmed.includes("/") && !/\s/.test(trimmed)) {
+      return pathToRepoKey(trimmed);
+    }
+    return undefined;
+  }
+}
+
+function pathToRepoKey(path: string): string | undefined {
+  let normalized = path.replace(/^\/+/, "").replace(/\/+$/, "");
+  if (normalized.toLowerCase().endsWith(".git")) {
+    normalized = normalized.slice(0, -4);
+  }
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length < 2) {
+    return undefined;
+  }
+  return parts.map((part) => part.toLowerCase()).join("/");
+}
+
+export function requestRepoKey(request: PendingRequest): string | undefined {
+  const fromUrl = repoKeyFromUrl(request.repoUrl);
+  if (fromUrl) {
+    return fromUrl;
   }
   if (request.repoOwner && request.repoName) {
-    return `https://github.com/${request.repoOwner}/${request.repoName}`;
-  }
-  if (fromLabel && fromLabel.includes("/")) {
-    return `https://github.com/${fromLabel}`;
+    return repoKeyFromOwnerName(request.repoOwner, request.repoName);
   }
   return undefined;
 }
 
-export function requestHasRepo(request: PendingRequest): boolean {
-  return Boolean(requestRepoUrl(request));
-}
-
-export function requestPoolName(request: PendingRequest): string | undefined {
-  return labelValue(request, "pool");
-}
-
-export function poolMatchesRequest(pool: ResolvedPool, request: PendingRequest): boolean {
-  const requestedPool = requestPoolName(request);
-  if (requestedPool && requestedPool !== pool.name) {
-    return false;
-  }
-  const repoUrl = requestRepoUrl(request);
-  if (!repoUrl) {
-    // Repo-less demand is pool-label scoped only. Broadcast still refuses
-    // until the pool has served work and has a clone.
-    return true;
-  }
-  if (pool.repos.length === 0) {
-    // Repo-less pool config: accept any repo-backed request (first serve seeds later broadcast).
-    return true;
-  }
-  return pool.repos.some((repo) => repoUrlsEqual(repo, repoUrl));
-}
-
-export function matchingPools(pools: ResolvedPool[], request: PendingRequest): ResolvedPool[] {
-  return pools.filter((pool) => poolMatchesRequest(pool, request));
-}
-
-export function isActiveSlot(slot: SlotSnapshot): boolean {
-  return ACTIVE_STATUSES.has(slot.status);
-}
-
-export function slotsForPool(slots: SlotSnapshot[], poolName: string): SlotSnapshot[] {
-  return slots.filter((slot) => slot.poolName === poolName && isActiveSlot(slot));
-}
-
-export function slotCoversRequest(slot: SlotSnapshot, request: PendingRequest): boolean {
-  if (slot.requestId && slot.requestId === request.id) {
-    return true;
-  }
-  const repoUrl = requestRepoUrl(request);
-  if (!repoUrl || slot.status === "launching") {
-    return slot.requestId === request.id;
-  }
-  return false;
-}
-
-function defaultWorkerName(mode: LaunchMode, poolName: string, requestId?: string): string {
-  const suffix = Math.random().toString(16).slice(2, 10);
-  if (requestId) {
-    const short = requestId.replace(/^bc-/, "").slice(0, 8);
-    return `pw_${mode}_${short}_${suffix}`;
-  }
-  return `pw_${mode}_${poolName}_${suffix}`;
-}
-
-function cooldownActive(untilMs: number | undefined, nowMs: number): boolean {
-  return typeof untilMs === "number" && untilMs > nowMs;
-}
-
-function poolOnLaunchCooldown(cooldowns: CooldownState, poolName: string, nowMs: number, windowMs: number): boolean {
-  const last = cooldowns.poolLaunchAtMs[poolName];
-  return typeof last === "number" && nowMs - last < windowMs;
+export function poolNameFromRequest(request: PendingRequest): string {
+  const label = request.labels.find((entry) => entry.key === POOL_LABEL_KEY)?.value?.trim();
+  return label || DEFAULT_POOL_NAME;
 }
 
 /**
- * Plan serve / broadcast / warm launches.
- *
- * Serve: one worker per repo-backed pending request that matches a pool
- * with a free slot. Released cursor-agent requires `--worker-dir` to be a
- * git clone, so repo-less requests are never served directly.
- *
- * Broadcast: leftover demand (typically repo-less pending) on a pool that
- * has already served work and therefore has a clone to advertise.
- *
- * Warm: fill minWorkers when the pool already has repos it can clone.
+ * A request matches a pool only when the pool label agrees and a repo
+ * identity can be resolved. An empty `pool.repos` ("any repo") still
+ * requires `request.repoUrl` so the worker has something to clone.
  */
-export function planLaunches(input: PlanInput): PlanResult {
-  const createWorkerName = input.createWorkerName ?? defaultWorkerName;
-  const intents: LaunchIntent[] = [];
-  const skipped: SkipReason[] = [];
-  const reservedByPool = new Map<string, number>();
-  const coveredRequestIds = new Set<string>();
-
-  const reserve = (poolName: string): void => {
-    reservedByPool.set(poolName, (reservedByPool.get(poolName) ?? 0) + 1);
-  };
-  const used = (pool: ResolvedPool): number =>
-    slotsForPool(input.slots, pool.name).length + (reservedByPool.get(pool.name) ?? 0);
-  const freeSlots = (pool: ResolvedPool): number => Math.max(0, pool.maxWorkers - used(pool));
-
-  const emit = (intent: LaunchIntent): void => {
-    intents.push(intent);
-    reserve(intent.poolName);
-    if (intent.requestId) {
-      coveredRequestIds.add(intent.requestId);
-    }
-  };
-
-  // --- serve --------------------------------------------------------------
-  for (const request of input.pending) {
-    if (!requestHasRepo(request)) {
-      skipped.push({
-        requestId: request.id,
-        reason: "skip_no_repo: released cursor-agent requires a git clone for --worker-dir",
-      });
-      continue;
-    }
-    if (input.slots.some((slot) => slotCoversRequest(slot, request))) {
-      coveredRequestIds.add(request.id);
-      skipped.push({ requestId: request.id, reason: "already_assigned" });
-      continue;
-    }
-    if (cooldownActive(input.cooldowns.requestUntilMs[request.id], input.nowMs)) {
-      skipped.push({ requestId: request.id, reason: "request_cooldown" });
-      continue;
-    }
-
-    const pools = matchingPools(input.pools, request);
-    if (pools.length === 0) {
-      skipped.push({ requestId: request.id, reason: "no_matching_pool" });
-      continue;
-    }
-
-    const pool = pools.find((candidate) => {
-      if (freeSlots(candidate) <= 0) {
-        return false;
-      }
-      return !poolOnLaunchCooldown(input.cooldowns, candidate.name, input.nowMs, input.poolLaunchCooldownMs);
-    });
-    if (!pool) {
-      const capacityFull = pools.every((candidate) => freeSlots(candidate) <= 0);
-      skipped.push({
-        requestId: request.id,
-        poolName: pools[0]?.name,
-        reason: capacityFull ? "pool_at_capacity" : "pool_launch_cooldown",
-      });
-      continue;
-    }
-
-    const repoUrl = requestRepoUrl(request);
-    if (!repoUrl) {
-      continue;
-    }
-    emit({
-      mode: "serve",
-      poolName: pool.name,
-      workerName: createWorkerName("serve", pool.name, request.id),
-      requestId: request.id,
-      repoUrls: [repoUrl],
-      reason: `serve ${request.id} on ${pool.name}`,
-    });
+export function requestMatchesPool(request: PendingRequest, pool: PoolConfig): boolean {
+  if (poolNameFromRequest(request) !== pool.name) {
+    return false;
   }
-
-  // --- broadcast ----------------------------------------------------------
-  for (const pool of input.pools) {
-    const leftover = input.pending.filter((request) => {
-      if (coveredRequestIds.has(request.id)) {
-        return false;
-      }
-      if (cooldownActive(input.cooldowns.requestUntilMs[request.id], input.nowMs)) {
-        return false;
-      }
-      return poolMatchesRequest(pool, request);
-    });
-    if (leftover.length === 0) {
-      continue;
-    }
-    if (!pool.hasServedWork) {
-      skipped.push({
-        poolName: pool.name,
-        reason: "broadcast_blocked_until_pool_has_served_work",
-      });
-      continue;
-    }
-    const repos = cloneReposForPool(pool);
-    if (repos.length === 0) {
-      skipped.push({
-        poolName: pool.name,
-        reason: "broadcast_blocked_no_clone_repos",
-      });
-      continue;
-    }
-    if (poolOnLaunchCooldown(input.cooldowns, pool.name, input.nowMs, input.poolLaunchCooldownMs)) {
-      skipped.push({ poolName: pool.name, reason: "pool_launch_cooldown" });
-      continue;
-    }
-    const toLaunch = Math.min(leftover.length, freeSlots(pool));
-    for (let i = 0; i < toLaunch; i += 1) {
-      const request = leftover[i];
-      emit({
-        mode: "broadcast",
-        poolName: pool.name,
-        workerName: createWorkerName("broadcast", pool.name, request.id),
-        requestId: request.id,
-        repoUrls: repos,
-        reason: `broadcast leftover demand on ${pool.name}`,
-      });
-    }
+  const key = requestRepoKey(request);
+  if (!key) {
+    return false;
   }
-
-  // --- warm ---------------------------------------------------------------
-  for (const pool of input.pools) {
-    const deficit = pool.minWorkers - used(pool);
-    if (deficit <= 0) {
-      continue;
-    }
-    const repos = cloneReposForPool(pool);
-    if (repos.length === 0) {
-      skipped.push({
-        poolName: pool.name,
-        reason: "warm_blocked_no_clone_repos",
-      });
-      continue;
-    }
-    if (poolOnLaunchCooldown(input.cooldowns, pool.name, input.nowMs, input.poolLaunchCooldownMs)) {
-      skipped.push({ poolName: pool.name, reason: "pool_launch_cooldown" });
-      continue;
-    }
-    for (let i = 0; i < deficit; i += 1) {
-      emit({
-        mode: "warm",
-        poolName: pool.name,
-        workerName: createWorkerName("warm", pool.name),
-        repoUrls: repos,
-        reason: `warm floor ${pool.minWorkers} on ${pool.name}`,
-      });
-    }
+  if (pool.repos.length === 0) {
+    return Boolean(request.repoUrl && repoKeyFromUrl(request.repoUrl));
   }
-
-  return { intents, skipped };
+  return pool.repos.some((repo) => repoKeyFromUrl(repo) === key);
 }
 
-export function applyLaunchCooldowns(
-  cooldowns: CooldownState,
-  intents: LaunchIntent[],
+/** Clone the pool's full repo list when configured, else the request repo. */
+export function repoUrlsForLaunch(request: PendingRequest, pool: PoolConfig): string[] {
+  if (pool.repos.length > 0) {
+    return [...pool.repos];
+  }
+  return request.repoUrl ? [request.repoUrl] : [];
+}
+
+export function containerNameForSlot(poolName: string, slotIndex: number): string {
+  return `pool=${poolName}/slot=${slotIndex}`;
+}
+
+export function containerNameForBroadcast(poolName: string): string {
+  return `pool=${poolName}/broadcast`;
+}
+
+export function workerNameForSlot(poolName: string, slotIndex: number): string {
+  return `aws-${poolName}-${slotIndex}`;
+}
+
+export function workerNameForBroadcast(poolName: string): string {
+  return `aws-${poolName}-broadcast`;
+}
+
+export function slotOnCooldown(slot: SlotState, nowMs: number): boolean {
+  return typeof slot.lastLaunchAtMs === "number" && nowMs - slot.lastLaunchAtMs < LAUNCH_COOLDOWN_MS;
+}
+
+export function requestOnCooldown(
+  requestLaunchTimes: Readonly<Record<string, number>>,
+  requestId: string,
   nowMs: number,
-  launchCooldownMs: number,
-): CooldownState {
-  const next: CooldownState = {
-    requestUntilMs: { ...cooldowns.requestUntilMs },
-    poolLaunchAtMs: { ...cooldowns.poolLaunchAtMs },
+): boolean {
+  const last = requestLaunchTimes[requestId];
+  return typeof last === "number" && nowMs - last < LAUNCH_COOLDOWN_MS;
+}
+
+export function isSlotFree(slot: SlotState, nowMs: number): boolean {
+  return slot.running !== true && !slotOnCooldown(slot, nowMs);
+}
+
+export function materializeSlots(existing: readonly SlotState[] | undefined, maxWorkers: number): SlotState[] {
+  const byIndex = new Map((existing ?? []).map((slot) => [slot.slotIndex, slot]));
+  const slots: SlotState[] = [];
+  for (let slotIndex = 0; slotIndex < maxWorkers; slotIndex += 1) {
+    slots.push(byIndex.get(slotIndex) ?? { slotIndex, running: false });
+  }
+  return slots;
+}
+
+function makeLaunch(input: {
+  poolName: string;
+  slotIndex: number;
+  spec: LaunchSpec;
+}): PlannedLaunch {
+  return {
+    containerName: containerNameForSlot(input.poolName, input.slotIndex),
+    slotIndex: input.slotIndex,
+    spec: input.spec,
   };
-  for (const intent of intents) {
-    next.poolLaunchAtMs[intent.poolName] = nowMs;
-    if (intent.requestId) {
-      next.requestUntilMs[intent.requestId] = nowMs + launchCooldownMs;
+}
+
+export interface PlanLaunchesInput {
+  readonly pools: readonly PoolConfig[];
+  readonly pending: readonly PendingRequest[];
+  readonly slotsByPool: Readonly<Record<string, readonly SlotState[]>>;
+  readonly requestLaunchTimes: Readonly<Record<string, number>>;
+  readonly nowMs: number;
+  readonly maxWorkersPerPool: number;
+}
+
+/**
+ * Serve launches: oldest pending request wins. Each request takes the first
+ * matching pool that still has a free slot (not running, not in cooldown).
+ * There is no per-pool "one launch per window" lock.
+ */
+export function planLaunches(input: PlanLaunchesInput): PlannedLaunch[] {
+  const reserved = new Set<string>();
+  const launches: PlannedLaunch[] = [];
+  const pending = [...input.pending].sort((a, b) => a.createdAtMs - b.createdAtMs);
+
+  for (const request of pending) {
+    if (requestOnCooldown(input.requestLaunchTimes, request.id, input.nowMs)) {
+      continue;
+    }
+    for (const pool of input.pools) {
+      if (!requestMatchesPool(request, pool)) {
+        continue;
+      }
+      const maxWorkers = pool.maxWorkers ?? input.maxWorkersPerPool;
+      const slots = materializeSlots(input.slotsByPool[pool.name], maxWorkers);
+      const free = slots.find((slot) => {
+        const name = containerNameForSlot(pool.name, slot.slotIndex);
+        return !reserved.has(name) && isSlotFree(slot, input.nowMs);
+      });
+      if (!free) {
+        continue;
+      }
+      const repoUrls = repoUrlsForLaunch(request, pool);
+      if (repoUrls.length === 0) {
+        continue;
+      }
+      const containerName = containerNameForSlot(pool.name, free.slotIndex);
+      reserved.add(containerName);
+      launches.push(
+        makeLaunch({
+          poolName: pool.name,
+          slotIndex: free.slotIndex,
+          spec: {
+            mode: "serve",
+            poolName: pool.name,
+            repoUrls,
+            workerName: workerNameForSlot(pool.name, free.slotIndex),
+            requestId: request.id,
+          },
+        }),
+      );
+      break;
+    }
+  }
+
+  return launches;
+}
+
+export interface PlanWarmLaunchesInput {
+  readonly pools: readonly PoolConfig[];
+  readonly slotsByPool: Readonly<Record<string, readonly SlotState[]>>;
+  readonly reservedContainerNames: ReadonlySet<string>;
+  readonly nowMs: number;
+  readonly minWorkersPerPool: number;
+  readonly maxWorkersPerPool: number;
+}
+
+/**
+ * Warm floor: only pools that already have clone URLs. `running` includes a
+ * live MicroVM or a suspended one we are keeping as the floor. Slots reserved
+ * by serve this tick count toward minWorkers and are not launched as warm.
+ */
+export function planWarmLaunches(input: PlanWarmLaunchesInput): PlannedLaunch[] {
+  const reserved = new Set(input.reservedContainerNames);
+  const launches: PlannedLaunch[] = [];
+
+  for (const pool of input.pools) {
+    if (pool.repos.length === 0) {
+      continue;
+    }
+    const maxWorkers = pool.maxWorkers ?? input.maxWorkersPerPool;
+    const minWorkers = pool.minWorkers ?? input.minWorkersPerPool;
+    const slots = materializeSlots(input.slotsByPool[pool.name], maxWorkers);
+    const occupied = slots.filter((slot) => {
+      const name = containerNameForSlot(pool.name, slot.slotIndex);
+      return slot.running === true || reserved.has(name);
+    }).length;
+    let need = Math.max(0, minWorkers - occupied);
+    if (need === 0) {
+      continue;
+    }
+    for (const slot of slots) {
+      if (need <= 0) {
+        break;
+      }
+      const containerName = containerNameForSlot(pool.name, slot.slotIndex);
+      if (reserved.has(containerName) || !isSlotFree(slot, input.nowMs)) {
+        continue;
+      }
+      reserved.add(containerName);
+      launches.push(
+        makeLaunch({
+          poolName: pool.name,
+          slotIndex: slot.slotIndex,
+          spec: {
+            mode: "warm",
+            poolName: pool.name,
+            repoUrls: [...pool.repos],
+            workerName: workerNameForSlot(pool.name, slot.slotIndex),
+          },
+        }),
+      );
+      need -= 1;
+    }
+  }
+
+  return launches;
+}
+
+export function planBroadcastLaunch(pool: PoolConfig): PlannedLaunch {
+  return {
+    containerName: containerNameForBroadcast(pool.name),
+    slotIndex: -1,
+    spec: {
+      mode: "broadcast",
+      poolName: pool.name,
+      repoUrls: [...pool.repos],
+      workerName: workerNameForBroadcast(pool.name),
+    },
+  };
+}
+
+export function pruneRequestLaunchTimes(
+  requestLaunchTimes: Readonly<Record<string, number>>,
+  nowMs: number,
+): Record<string, number> {
+  const next: Record<string, number> = {};
+  for (const [id, atMs] of Object.entries(requestLaunchTimes)) {
+    if (nowMs - atMs < REQUEST_RECORD_TTL_MS) {
+      next[id] = atMs;
     }
   }
   return next;
 }
 
-export function expireCooldowns(cooldowns: CooldownState, nowMs: number): CooldownState {
-  const requestUntilMs: Record<string, number> = {};
-  for (const [id, until] of Object.entries(cooldowns.requestUntilMs)) {
-    if (until > nowMs) {
-      requestUntilMs[id] = until;
-    }
-  }
-  return { requestUntilMs, poolLaunchAtMs: { ...cooldowns.poolLaunchAtMs } };
-}
-
-export function describeRequestRepo(request: PendingRequest): string | undefined {
-  const url = requestRepoUrl(request);
-  if (!url) {
-    return undefined;
-  }
-  const identity = repoIdentityFromUrl(url);
-  return identity ? `${identity.owner}/${identity.name}` : url;
+export function reservedContainerNames(launches: readonly PlannedLaunch[]): Set<string> {
+  return new Set(launches.map((launch) => launch.containerName));
 }

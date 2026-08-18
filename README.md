@@ -39,10 +39,10 @@ flowchart LR
 
 ```
 src/                 # Scheduler + platform-free planner (TypeScript)
-  matching.ts        # serve / broadcast / warm + cooldowns (no AWS imports)
+  matching.ts        # Cloudflare planner: serve / broadcast / warm (no AWS imports)
   config.ts          # POOLS JSON + knobs (no AWS imports)
-  types.ts
-  cursor-api.ts      # pending-requests + optional claim
+  types.ts           # Cloudflare planner types
+  cursor-api.ts      # Bearer auth, pending-requests, listWorkers/listPools, optional claim
   launch-spec.ts     # RunMicrovm payload builder
   slot-state.ts      # in-memory slot store used by DynamoDB + tests
   scheduler.ts
@@ -66,7 +66,7 @@ Same knobs as the Cloudflare `wrangler.jsonc` vars:
 | `MAX_WORKERS_PER_POOL` | `3` | Cap unless a pool overrides `maxWorkers` |
 | `MIN_WORKERS_PER_POOL` | `1` | Warm floor unless a pool overrides `minWorkers` |
 | `WORKER_IDLE_RELEASE_TIMEOUT_SECONDS` | `300` | Passed to `cursor-agent --idle-release-timeout` |
-| `POLL_INTERVAL_SECONDS` | `60` | Planner interval. EventBridge `rate()` cannot go below 1 minute |
+| `POLL_INTERVAL_SECONDS` | `20` (Cloudflare) / EventBridge `1 minute` | Planner interval. EventBridge `rate()` cannot go below 1 minute |
 | `CURSOR_API_URL` | `https://api.cursor.com` | Fleet-management API |
 | `CURSOR_AGENT_ENDPOINT` | `https://api2.cursor.sh` | Worker bridge |
 
@@ -85,15 +85,17 @@ Example `POOLS`:
 
 ### Launch modes
 
-- **serve** — pending request has a repo that matches a pool, and the pool has a free slot. One MicroVM is launched (or a suspended slot is resumed) for that request.
-- **broadcast** — leftover demand (usually repo-less pending) on a pool that has **already served work**, so there is a git clone to hand to `cursor-agent`.
-- **warm** — fill `minWorkers` when the pool already has repos it can clone.
+Same planner as the Cloudflare reference (`src/matching.ts`):
 
-Launch cooldowns prevent double-starting the same request while a worker is still connecting (DynamoDB replaces the Cloudflare Durable Object).
+- **serve** — oldest matching pending request wins a free `pool=<name>/slot=<n>`. Missing `pool` label targets pool `default`. Repo identity is `repoKeyFromUrl` / `repoKeyFromOwnerName` (lowercase owner/name, GitLab nested groups, ssh/https/git@). A request with no resolvable repo never matches. Any-repo pools still require `request.repoUrl`. Serve clones the pool's **full** `repos` list when configured, else `[request.repoUrl]`.
+- **broadcast** — one-off register boot (`pool=<name>/broadcast`) when `poolConfigFingerprint` changes, so durable pool rows appear in the composer picker. Not leftover demand after serve.
+- **warm** — fill `minWorkers` only on pools that already have clone URLs. Slots reserved by serve this tick are skipped. A live **or suspended** MicroVM counts as `running` toward the floor.
+
+Per-slot and per-request cooldown is 120s (`LAUNCH_COOLDOWN_MS`). Request records expire after 15 minutes. There is no per-pool "one launch per window" lock. Worker display names use an `aws-` prefix.
 
 ### CLI limitation (same as Cloudflare)
 
-Released `cursor-agent` requires each `--worker-dir` to be a **git clone**. The planner **skips pending requests with no repo**. Repo-less pools cannot broadcast or warm until they have served at least one repo-backed request (that clone is remembered as `lastServedRepos`).
+Released `cursor-agent` requires each `--worker-dir` to be a **git clone**. Requests without a resolvable repo never match. Warm and broadcast require the pool to list clone URLs.
 
 ## Secrets
 

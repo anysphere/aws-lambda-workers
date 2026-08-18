@@ -1,11 +1,16 @@
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
-import { loadPlannerSettings, resolvePools } from "./config.js";
+import { loadPlannerSettings, poolConfigFingerprint, type PlannerSettings } from "./config.js";
 import { CursorApiClient } from "./cursor-api.js";
 import { buildLaunchSpec, type LaunchSpecInput } from "./launch-spec.js";
-import { planLaunches } from "./matching.js";
+import {
+  planBroadcastLaunch,
+  planLaunches,
+  planWarmLaunches,
+  reservedContainerNames,
+} from "./matching.js";
 import { LaunchMicroVmError, type MicroVmClient } from "./microvm.js";
-import { gcSlots, recordLaunches, type SlotStore } from "./slot-state.js";
-import type { LaunchIntent, PendingRequest, PlanResult, PlannerSettings } from "./types.js";
+import { gcSlots, plannerSlotsByPool, recordLaunches, type SlotStore } from "./slot-state.js";
+import type { PendingRequest, PlannedLaunch } from "./types.js";
 
 export interface SchedulerEnv {
   [key: string]: string | undefined;
@@ -13,10 +18,10 @@ export interface SchedulerEnv {
 
 export interface TickResult {
   pending: number;
-  intents: LaunchIntent[];
-  launched: Array<{ workerName: string; microvmId?: string; action: string }>;
-  skipped: PlanResult["skipped"];
+  launches: PlannedLaunch[];
+  launched: Array<{ workerName: string; microvmId?: string; action: string; mode: string }>;
   errors: string[];
+  fingerprintChanged: boolean;
 }
 
 export interface SchedulerDeps {
@@ -27,68 +32,79 @@ export interface SchedulerDeps {
   claim?: (bcId: string, workerId: string) => Promise<{ workerId: string } | undefined>;
   microvms: MicroVmClient;
   settings: PlannerSettings;
-  launchSpecBase: Omit<LaunchSpecInput, "intent">;
+  launchSpecBase: Omit<LaunchSpecInput, "spec">;
 }
 
 export async function tickOnce(deps: SchedulerDeps): Promise<TickResult> {
   const nowMs = (deps.nowMs ?? Date.now)();
-  let store = gcSlots(await deps.loadStore(), nowMs, deps.settings.launchCooldownMs * 4);
+  let store = gcSlots(await deps.loadStore(), nowMs);
   const pending = await deps.listPending();
-  const pools = resolvePools(deps.settings, store.poolMeta);
-  const plan = planLaunches({
-    pools,
-    pending,
-    slots: store.slots,
-    cooldowns: store.cooldowns,
-    nowMs,
-    launchCooldownMs: deps.settings.launchCooldownMs,
-    poolLaunchCooldownMs: deps.settings.poolLaunchCooldownMs,
-  });
+  const slotsByPool = plannerSlotsByPool(store);
+  const fingerprint = poolConfigFingerprint(deps.settings.pools);
+  const fingerprintChanged = store.poolConfigFingerprint !== fingerprint;
 
+  const serve = planLaunches({
+    pools: deps.settings.pools,
+    pending,
+    slotsByPool,
+    requestLaunchTimes: store.requestLaunchTimes,
+    nowMs,
+    maxWorkersPerPool: deps.settings.maxWorkersPerPool,
+  });
+  const warm = planWarmLaunches({
+    pools: deps.settings.pools,
+    slotsByPool,
+    reservedContainerNames: reservedContainerNames(serve),
+    nowMs,
+    minWorkersPerPool: deps.settings.minWorkersPerPool,
+    maxWorkersPerPool: deps.settings.maxWorkersPerPool,
+  });
+  const broadcast = fingerprintChanged
+    ? deps.settings.pools.filter((pool) => pool.repos.length > 0).map(planBroadcastLaunch)
+    : [];
+
+  const planned = [...serve, ...warm, ...broadcast];
   const launched: TickResult["launched"] = [];
   const errors: string[] = [];
-  const applied: LaunchIntent[] = [];
+  const applied: PlannedLaunch[] = [];
+  const appliedMeta: Array<{ launch: PlannedLaunch; microvmId?: string }> = [];
 
-  for (const intent of plan.intents) {
+  for (const launch of planned) {
     try {
-      if (intent.requestId && deps.claim) {
-        const claimed = await deps.claim(intent.requestId, intent.workerName);
+      let spec = launch.spec;
+      if (spec.requestId && deps.claim) {
+        const claimed = await deps.claim(spec.requestId, spec.workerName);
         if (claimed?.workerId) {
-          intent.workerName = claimed.workerId;
+          spec = { ...spec, workerName: claimed.workerId };
         }
       }
-      const spec = buildLaunchSpec({ ...deps.launchSpecBase, intent }, store.slots);
-      const result = await deps.microvms.launch(spec);
-      applied.push(intent);
-      store = recordLaunches(
-        store,
-        [intent],
-        nowMs,
-        deps.settings.launchCooldownMs,
-        [{ intent, microvmId: result.microvmId }],
-      );
+      const microvmSpec = buildLaunchSpec({ ...deps.launchSpecBase, spec }, store.slots, launch.slotIndex);
+      const result = await deps.microvms.launch(microvmSpec);
+      const recorded = { ...launch, spec };
+      applied.push(recorded);
+      appliedMeta.push({ launch: recorded, microvmId: result.microvmId });
       launched.push({
-        workerName: intent.workerName,
+        workerName: spec.workerName,
         microvmId: result.microvmId,
-        action: spec.action,
+        action: microvmSpec.action,
+        mode: spec.mode,
       });
     } catch (error) {
       const message = error instanceof LaunchMicroVmError ? error.message : String(error);
-      errors.push(`${intent.workerName}: ${message}`);
+      errors.push(`${launch.spec.workerName}: ${message}`);
     }
   }
 
-  if (applied.length === 0 && plan.intents.length === 0) {
-    store = gcSlots(store, nowMs, deps.settings.launchCooldownMs * 4);
-  }
+  store = recordLaunches(store, applied, nowMs, appliedMeta);
+  store = { ...store, poolConfigFingerprint: fingerprint };
   await deps.saveStore(store);
 
   return {
     pending: pending.length,
-    intents: plan.intents,
+    launches: planned,
     launched,
-    skipped: plan.skipped,
     errors,
+    fingerprintChanged,
   };
 }
 
@@ -106,26 +122,27 @@ export function schedulerSettingsFromEnv(env: SchedulerEnv): PlannerSettings {
   return loadPlannerSettings(env);
 }
 
-export async function createLiveDeps(env: SchedulerEnv, microvms: MicroVmClient, store: {
-  load: () => Promise<SlotStore>;
-  save: (store: SlotStore) => Promise<void>;
-}): Promise<SchedulerDeps> {
+export async function createLiveDeps(
+  env: SchedulerEnv,
+  microvms: MicroVmClient,
+  store: {
+    load: () => Promise<SlotStore>;
+    save: (store: SlotStore) => Promise<void>;
+  },
+): Promise<SchedulerDeps> {
   const settings = schedulerSettingsFromEnv(env);
   const region = env.AWS_REGION || env.AWS_DEFAULT_REGION || "us-east-1";
   const paramName = env.CURSOR_API_KEY_PARAM_NAME;
   if (!paramName) {
     throw new Error("CURSOR_API_KEY_PARAM_NAME is required");
   }
-  // Scheduler reads the key at runtime to poll pending-requests. The raw
-  // value is never placed in the function environment or the MicroVM payload;
-  // the MicroVM receives only this parameter name.
   const apiKey = await loadCursorApiKey(paramName, region);
   const cursor = new CursorApiClient({ apiUrl: settings.cursorApiUrl, apiKey });
 
   return {
     loadStore: store.load,
     saveStore: store.save,
-    listPending: () => cursor.listAllPendingRequests(),
+    listPending: () => cursor.listPendingRequests(),
     claim: async (bcId, workerId) => {
       try {
         return await cursor.claim(bcId, workerId);

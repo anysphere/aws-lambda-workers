@@ -79,8 +79,8 @@ async function statusBody(): Promise<unknown> {
   return {
     ok: true,
     slots: state.slots,
-    poolMeta: state.poolMeta,
-    cooldownRequests: Object.keys(state.cooldowns.requestUntilMs).length,
+    requestLaunchTimes: Object.keys(state.requestLaunchTimes).length,
+    poolConfigFingerprint: state.poolConfigFingerprint,
   };
 }
 

@@ -1,61 +1,60 @@
 import { describe, expect, it } from "vitest";
-import { emptySlotStore, gcSlots, recordLaunches, removeSlot } from "../src/slot-state.js";
-import type { LaunchIntent } from "../src/types.js";
+import { emptySlotStore, gcSlots, plannerSlotsByPool, recordLaunches, runningFromMicrovmStatus } from "../src/slot-state.js";
+import { containerNameForSlot, REQUEST_RECORD_TTL_MS } from "../src/matching.js";
+import type { PlannedLaunch } from "../src/types.js";
 
-const intent: LaunchIntent = {
-  mode: "serve",
-  poolName: "default",
-  workerName: "pw_1",
-  requestId: "bc-1",
-  repoUrls: ["https://github.com/acme/app"],
-  reason: "test",
+const launch: PlannedLaunch = {
+  containerName: containerNameForSlot("default", 0),
+  slotIndex: 0,
+  spec: {
+    mode: "serve",
+    poolName: "default",
+    workerName: "aws-default-0",
+    requestId: "bc-1",
+    repoUrls: ["https://github.com/acme/app"],
+  },
 };
 
 describe("recordLaunches", () => {
-  it("inserts launching slots, request cooldown, and served-work metadata", () => {
-    const next = recordLaunches(emptySlotStore(), [intent], 10_000, 60_000, [
-      { intent, microvmId: "m-1" },
+  it("inserts a slot, request launch time, and planner running flag", () => {
+    const next = recordLaunches(emptySlotStore(), [launch], 10_000, [
+      { launch, microvmId: "m-1" },
     ]);
     expect(next.slots).toEqual([
       expect.objectContaining({
-        workerName: "pw_1",
+        workerName: "aws-default-0",
+        containerName: "pool=default/slot=0",
+        slotIndex: 0,
+        running: true,
         status: "launching",
         microvmId: "m-1",
         requestId: "bc-1",
       }),
     ]);
-    expect(next.cooldowns.requestUntilMs["bc-1"]).toBe(70_000);
-    expect(next.poolMeta.default).toEqual({
-      hasServedWork: true,
-      lastServedRepos: ["https://github.com/acme/app"],
+    expect(next.requestLaunchTimes["bc-1"]).toBe(10_000);
+    expect(plannerSlotsByPool(next).default?.[0]).toEqual({
+      slotIndex: 0,
+      running: true,
+      lastLaunchAtMs: 10_000,
     });
   });
 
-  it("does not mark broadcast/warm as served work", () => {
-    const warm: LaunchIntent = { ...intent, mode: "warm", requestId: undefined };
-    const next = recordLaunches(emptySlotStore(), [warm], 10_000, 60_000);
-    expect(next.poolMeta.default).toBeUndefined();
+  it("maps suspended MicroVMs as running for the warm floor", () => {
+    expect(runningFromMicrovmStatus("suspended")).toBe(true);
+    expect(runningFromMicrovmStatus("running")).toBe(true);
+    expect(runningFromMicrovmStatus("stopped")).toBe(false);
   });
 });
 
 describe("gcSlots", () => {
-  it("expires request cooldowns and drops aged stopping slots", () => {
-    let store = recordLaunches(emptySlotStore(), [intent], 10_000, 60_000);
-    store = removeSlot(store, "default", "pw_1");
+  it("expires request launch times older than REQUEST_RECORD_TTL_MS", () => {
+    let store = recordLaunches(emptySlotStore(), [launch], 10_000);
     store = {
       ...store,
-      slots: [
-        {
-          poolName: "default",
-          workerName: "old",
-          status: "stopping",
-          repoUrls: [],
-          launchedAtMs: 1,
-        },
-      ],
+      slots: [{ ...store.slots[0]!, status: "stopped", running: false }],
     };
-    const cleaned = gcSlots(store, 100_000, 1_000);
+    const cleaned = gcSlots(store, 10_000 + REQUEST_RECORD_TTL_MS + 1);
     expect(cleaned.slots).toEqual([]);
-    expect(cleaned.cooldowns.requestUntilMs["bc-1"]).toBeUndefined();
+    expect(cleaned.requestLaunchTimes["bc-1"]).toBeUndefined();
   });
 });

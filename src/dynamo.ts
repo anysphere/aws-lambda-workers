@@ -1,18 +1,11 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import {
-  DeleteCommand,
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-  QueryCommand,
-  ScanCommand,
-} from "@aws-sdk/lib-dynamodb";
-import type { PoolMeta, SlotStore } from "./slot-state.js";
-import type { CooldownState, SlotSnapshot } from "./types.js";
+import { DeleteCommand, DynamoDBDocumentClient, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { runningFromMicrovmStatus, type AwsSlot, type AwsSlotStatus, type SlotStore } from "./slot-state.js";
 
 const SLOT_PREFIX = "SLOT#";
-const META_SK = "META";
-const COOLDOWN_PK = "COOLDOWN";
+const STATE_PK = "STATE";
+const REQUESTS_SK = "REQUESTS";
+const FINGERPRINT_SK = "FINGERPRINT";
 
 export class DynamoSlotStore {
   private readonly table: string;
@@ -24,9 +17,9 @@ export class DynamoSlotStore {
   }
 
   async load(): Promise<SlotStore> {
-    const slots: SlotSnapshot[] = [];
-    const poolMeta: Record<string, PoolMeta> = {};
-    const cooldowns: CooldownState = { requestUntilMs: {}, poolLaunchAtMs: {} };
+    const slots: AwsSlot[] = [];
+    let requestLaunchTimes: Record<string, number> = {};
+    let poolConfigFingerprint: string | undefined;
 
     let startKey: Record<string, unknown> | undefined;
     do {
@@ -40,39 +33,40 @@ export class DynamoSlotStore {
         const pk = String(item.pk ?? "");
         const sk = String(item.sk ?? "");
         if (pk.startsWith("POOL#") && sk.startsWith(SLOT_PREFIX)) {
+          const status = (item.status ?? "stopped") as AwsSlotStatus;
           slots.push({
             poolName: pk.slice("POOL#".length),
-            workerName: String(item.workerName ?? sk.slice(SLOT_PREFIX.length)),
-            status: item.status,
+            slotIndex: Number(item.slotIndex ?? 0),
+            containerName: String(item.containerName ?? sk.slice(SLOT_PREFIX.length)),
+            workerName: String(item.workerName ?? ""),
+            running: item.running === undefined ? runningFromMicrovmStatus(status) : Boolean(item.running),
+            status,
+            lastLaunchAtMs: item.lastLaunchAtMs === undefined ? undefined : Number(item.lastLaunchAtMs),
+            microvmId: item.microvmId,
             requestId: item.requestId,
             repoUrls: item.repoUrls ?? [],
-            launchedAtMs: Number(item.launchedAtMs ?? 0),
-            microvmId: item.microvmId,
+            mode: item.mode,
           });
-        } else if (pk.startsWith("POOL#") && sk === META_SK) {
-          poolMeta[pk.slice("POOL#".length)] = {
-            hasServedWork: Boolean(item.hasServedWork),
-            lastServedRepos: item.lastServedRepos ?? [],
-          };
-        } else if (pk === COOLDOWN_PK && sk.startsWith("REQUEST#")) {
-          cooldowns.requestUntilMs[sk.slice("REQUEST#".length)] = Number(item.untilMs ?? 0);
-        } else if (pk === COOLDOWN_PK && sk.startsWith("POOL#")) {
-          cooldowns.poolLaunchAtMs[sk.slice("POOL#".length)] = Number(item.atMs ?? 0);
+        } else if (pk === STATE_PK && sk === REQUESTS_SK) {
+          requestLaunchTimes = (item.times as Record<string, number>) ?? {};
+        } else if (pk === STATE_PK && sk === FINGERPRINT_SK) {
+          poolConfigFingerprint = typeof item.fingerprint === "string" ? item.fingerprint : undefined;
         }
       }
       startKey = page.LastEvaluatedKey;
     } while (startKey);
 
-    return { slots, cooldowns, poolMeta };
+    return { slots, requestLaunchTimes, poolConfigFingerprint };
   }
 
   async save(store: SlotStore, ttlSeconds = 32_400): Promise<void> {
     const existing = await this.load();
     const nextKeys = new Set<string>();
+    const ttl = Math.floor(Date.now() / 1000) + ttlSeconds;
 
     for (const slot of store.slots) {
       const pk = `POOL#${slot.poolName}`;
-      const sk = `${SLOT_PREFIX}${slot.workerName}`;
+      const sk = `${SLOT_PREFIX}${slot.containerName}`;
       nextKeys.add(`${pk}|${sk}`);
       await this.doc.send(
         new PutCommand({
@@ -80,110 +74,62 @@ export class DynamoSlotStore {
           Item: {
             pk,
             sk,
+            poolName: slot.poolName,
+            slotIndex: slot.slotIndex,
+            containerName: slot.containerName,
             workerName: slot.workerName,
+            running: slot.running,
             status: slot.status,
+            lastLaunchAtMs: slot.lastLaunchAtMs,
+            microvmId: slot.microvmId,
             requestId: slot.requestId,
             repoUrls: slot.repoUrls,
-            launchedAtMs: slot.launchedAtMs,
-            microvmId: slot.microvmId,
-            ttl: Math.floor(Date.now() / 1000) + ttlSeconds,
+            mode: slot.mode,
+            ttl,
           },
         }),
       );
     }
 
-    for (const [poolName, meta] of Object.entries(store.poolMeta)) {
-      const pk = `POOL#${poolName}`;
-      nextKeys.add(`${pk}|${META_SK}`);
+    const requestsPk = STATE_PK;
+    nextKeys.add(`${requestsPk}|${REQUESTS_SK}`);
+    await this.doc.send(
+      new PutCommand({
+        TableName: this.table,
+        Item: {
+          pk: requestsPk,
+          sk: REQUESTS_SK,
+          times: store.requestLaunchTimes,
+          ttl,
+        },
+      }),
+    );
+
+    if (store.poolConfigFingerprint) {
+      nextKeys.add(`${STATE_PK}|${FINGERPRINT_SK}`);
       await this.doc.send(
         new PutCommand({
           TableName: this.table,
           Item: {
-            pk,
-            sk: META_SK,
-            hasServedWork: meta.hasServedWork,
-            lastServedRepos: meta.lastServedRepos,
+            pk: STATE_PK,
+            sk: FINGERPRINT_SK,
+            fingerprint: store.poolConfigFingerprint,
           },
-        }),
-      );
-    }
-
-    for (const [requestId, untilMs] of Object.entries(store.cooldowns.requestUntilMs)) {
-      const pk = COOLDOWN_PK;
-      const sk = `REQUEST#${requestId}`;
-      nextKeys.add(`${pk}|${sk}`);
-      await this.doc.send(
-        new PutCommand({
-          TableName: this.table,
-          Item: {
-            pk,
-            sk,
-            untilMs,
-            ttl: Math.ceil(untilMs / 1000),
-          },
-        }),
-      );
-    }
-
-    for (const [poolName, atMs] of Object.entries(store.cooldowns.poolLaunchAtMs)) {
-      const pk = COOLDOWN_PK;
-      const sk = `POOL#${poolName}`;
-      nextKeys.add(`${pk}|${sk}`);
-      await this.doc.send(
-        new PutCommand({
-          TableName: this.table,
-          Item: { pk, sk, atMs },
         }),
       );
     }
 
     const stale = [
-      ...existing.slots.map((slot) => ({ pk: `POOL#${slot.poolName}`, sk: `${SLOT_PREFIX}${slot.workerName}` })),
-      ...Object.keys(existing.poolMeta).map((name) => ({ pk: `POOL#${name}`, sk: META_SK })),
-      ...Object.keys(existing.cooldowns.requestUntilMs).map((id) => ({ pk: COOLDOWN_PK, sk: `REQUEST#${id}` })),
-      ...Object.keys(existing.cooldowns.poolLaunchAtMs).map((name) => ({ pk: COOLDOWN_PK, sk: `POOL#${name}` })),
+      ...existing.slots.map((slot) => ({
+        pk: `POOL#${slot.poolName}`,
+        sk: `${SLOT_PREFIX}${slot.containerName}`,
+      })),
+      { pk: STATE_PK, sk: REQUESTS_SK },
+      { pk: STATE_PK, sk: FINGERPRINT_SK },
     ].filter((key) => !nextKeys.has(`${key.pk}|${key.sk}`));
 
     for (const key of stale) {
       await this.doc.send(new DeleteCommand({ TableName: this.table, Key: { pk: key.pk, sk: key.sk } }));
     }
-  }
-
-  async getPoolMeta(poolName: string): Promise<PoolMeta | undefined> {
-    const result = await this.doc.send(
-      new GetCommand({
-        TableName: this.table,
-        Key: { pk: `POOL#${poolName}`, sk: META_SK },
-      }),
-    );
-    if (!result.Item) {
-      return undefined;
-    }
-    return {
-      hasServedWork: Boolean(result.Item.hasServedWork),
-      lastServedRepos: result.Item.lastServedRepos ?? [],
-    };
-  }
-
-  async queryPoolSlots(poolName: string): Promise<SlotSnapshot[]> {
-    const result = await this.doc.send(
-      new QueryCommand({
-        TableName: this.table,
-        KeyConditionExpression: "pk = :pk AND begins_with(sk, :sk)",
-        ExpressionAttributeValues: {
-          ":pk": `POOL#${poolName}`,
-          ":sk": SLOT_PREFIX,
-        },
-      }),
-    );
-    return (result.Items ?? []).map((item) => ({
-      poolName,
-      workerName: String(item.workerName),
-      status: item.status,
-      requestId: item.requestId,
-      repoUrls: item.repoUrls ?? [],
-      launchedAtMs: Number(item.launchedAtMs ?? 0),
-      microvmId: item.microvmId,
-    }));
   }
 }

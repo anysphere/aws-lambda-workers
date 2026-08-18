@@ -4,7 +4,8 @@
  */
 
 import { MAX_RUN_LIFETIME_SECONDS } from "./config.js";
-import type { LaunchIntent, SlotSnapshot } from "./types.js";
+import type { LaunchSpec } from "./types.js";
+import type { AwsSlot } from "./slot-state.js";
 
 export const RUN_HOOK_PAYLOAD_VERSION = "1";
 
@@ -15,7 +16,7 @@ export interface IdlePolicySpec {
 }
 
 export interface LaunchSpecInput {
-  intent: LaunchIntent;
+  spec: LaunchSpec;
   imageIdentifier: string;
   executionRoleArn: string;
   cursorApiKeyParamName: string;
@@ -83,19 +84,19 @@ export function internetEgressArn(region: string): string {
 
 export function buildRunHookPayload(input: LaunchSpecInput): RunHookPayload {
   const worker: RunHookPayload["worker"] = {
-    poolName: input.intent.poolName,
-    workerName: input.intent.workerName,
-    workerId: input.intent.workerName,
-    repoUrls: input.intent.repoUrls,
-    mode: input.intent.mode,
+    poolName: input.spec.poolName,
+    workerName: input.spec.workerName,
+    workerId: input.spec.workerName,
+    repoUrls: [...input.spec.repoUrls],
+    mode: input.spec.mode,
     cursorApiUrl: input.cursorApiUrl,
     cursorAgentEndpoint: input.cursorAgentEndpoint,
     cursorApiKeyParamName: input.cursorApiKeyParamName,
     idleReleaseTimeoutSeconds: input.idleReleaseTimeoutSeconds,
     awsRegion: input.awsRegion,
   };
-  if (input.intent.requestId) {
-    worker.requestId = input.intent.requestId;
+  if (input.spec.requestId) {
+    worker.requestId = input.spec.requestId;
   }
   if (input.gitTokenParamName) {
     worker.gitTokenParamName = input.gitTokenParamName;
@@ -119,21 +120,26 @@ export function assertNoSecrets(payload: unknown): void {
   }
 }
 
-export function chooseResumeSlot(intent: LaunchIntent, slots: SlotSnapshot[]): SlotSnapshot | undefined {
-  const candidates = slots.filter(
+/**
+ * Resume the planned slot when it already has a MicroVM that is not live.
+ * Suspended slots count as running to the planner (warm floor), so this is
+ * used when a previous VM is stopped / reusable on that same slot index.
+ */
+export function chooseResumeSlot(spec: LaunchSpec, slotIndex: number, slots: AwsSlot[]): AwsSlot | undefined {
+  return slots.find(
     (slot) =>
-      slot.poolName === intent.poolName &&
-      slot.status === "suspended" &&
-      !slot.requestId,
+      slot.poolName === spec.poolName &&
+      slot.slotIndex === slotIndex &&
+      Boolean(slot.microvmId) &&
+      !slot.running,
   );
-  return candidates[0];
 }
 
-export function buildLaunchSpec(input: LaunchSpecInput, slots: SlotSnapshot[] = []): MicrovmLaunchSpec {
+export function buildLaunchSpec(input: LaunchSpecInput, slots: AwsSlot[] = [], slotIndex = 0): MicrovmLaunchSpec {
   const payload = buildRunHookPayload(input);
   assertNoSecrets(payload);
   const runHookPayload = JSON.stringify(payload);
-  const resume = chooseResumeSlot(input.intent, slots);
+  const resume = chooseResumeSlot(input.spec, slotIndex, slots);
   const idlePolicy = input.idlePolicy ?? DEFAULT_IDLE_POLICY;
   const maximumDurationInSeconds = input.maximumDurationSeconds ?? MAX_RUN_LIFETIME_SECONDS;
 

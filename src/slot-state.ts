@@ -1,113 +1,124 @@
 /**
- * In-memory slot / cooldown store. DynamoDB is one adapter; tests use this
- * object directly so planning logic stays platform-free.
+ * In-memory slot / request-cooldown store. DynamoDB is one adapter; tests
+ * use this object directly so planning logic stays platform-free.
  */
 
-import { applyLaunchCooldowns, expireCooldowns } from "./matching.js";
-import type { CooldownState, LaunchIntent, SlotSnapshot, SlotStatus } from "./types.js";
+import {
+  containerNameForSlot,
+  pruneRequestLaunchTimes,
+  REQUEST_RECORD_TTL_MS,
+} from "./matching.js";
+import type { LaunchMode, PlannedLaunch, SlotState } from "./types.js";
 
-export interface PoolMeta {
-  hasServedWork: boolean;
-  lastServedRepos: string[];
+export type AwsSlotStatus = "launching" | "running" | "suspended" | "stopped";
+
+export interface AwsSlot {
+  poolName: string;
+  slotIndex: number;
+  containerName: string;
+  workerName: string;
+  /**
+   * Planner `running` flag. True for a live MicroVM or a suspended one we
+   * keep as the warm floor.
+   */
+  running: boolean;
+  status: AwsSlotStatus;
+  lastLaunchAtMs?: number;
+  microvmId?: string;
+  requestId?: string;
+  repoUrls: string[];
+  mode?: LaunchMode;
 }
 
 export interface SlotStore {
-  slots: SlotSnapshot[];
-  cooldowns: CooldownState;
-  poolMeta: Record<string, PoolMeta>;
+  slots: AwsSlot[];
+  requestLaunchTimes: Record<string, number>;
+  poolConfigFingerprint?: string;
 }
 
 export function emptySlotStore(): SlotStore {
   return {
     slots: [],
-    cooldowns: { requestUntilMs: {}, poolLaunchAtMs: {} },
-    poolMeta: {},
+    requestLaunchTimes: {},
   };
 }
 
-export function upsertSlot(store: SlotStore, slot: SlotSnapshot): SlotStore {
+export function plannerSlotsByPool(store: SlotStore): Record<string, SlotState[]> {
+  const byPool: Record<string, SlotState[]> = {};
+  for (const slot of store.slots) {
+    if (slot.slotIndex < 0) {
+      continue;
+    }
+    const list = byPool[slot.poolName] ?? [];
+    list.push({
+      slotIndex: slot.slotIndex,
+      running: slot.running,
+      lastLaunchAtMs: slot.lastLaunchAtMs,
+    });
+    byPool[slot.poolName] = list;
+  }
+  return byPool;
+}
+
+/** Live or suspended MicroVMs occupy the warm floor. */
+export function runningFromMicrovmStatus(status: AwsSlotStatus): boolean {
+  return status === "launching" || status === "running" || status === "suspended";
+}
+
+export function upsertSlot(store: SlotStore, slot: AwsSlot): SlotStore {
   const slots = store.slots.filter(
-    (existing) => !(existing.poolName === slot.poolName && existing.workerName === slot.workerName),
+    (existing) =>
+      !(existing.poolName === slot.poolName && existing.containerName === slot.containerName),
   );
   slots.push(slot);
   return { ...store, slots };
 }
 
-export function markSlotStatus(
-  store: SlotStore,
-  poolName: string,
-  workerName: string,
-  status: SlotStatus,
-  extras: Partial<SlotSnapshot> = {},
-): SlotStore {
-  const existing = store.slots.find((slot) => slot.poolName === poolName && slot.workerName === workerName);
-  if (!existing) {
-    return store;
-  }
-  return upsertSlot(store, { ...existing, ...extras, status });
-}
-
-export function removeSlot(store: SlotStore, poolName: string, workerName: string): SlotStore {
-  return {
-    ...store,
-    slots: store.slots.filter((slot) => !(slot.poolName === poolName && slot.workerName === workerName)),
-  };
-}
-
 export function recordLaunches(
   store: SlotStore,
-  intents: LaunchIntent[],
+  launches: readonly PlannedLaunch[],
   nowMs: number,
-  launchCooldownMs: number,
-  launched: Array<{ intent: LaunchIntent; microvmId?: string }> = [],
+  launched: Array<{ launch: PlannedLaunch; microvmId?: string; status?: AwsSlotStatus }> = [],
 ): SlotStore {
   let next: SlotStore = {
     ...store,
-    cooldowns: applyLaunchCooldowns(store.cooldowns, intents, nowMs, launchCooldownMs),
+    requestLaunchTimes: { ...store.requestLaunchTimes },
   };
-  for (const { intent, microvmId } of launched.length > 0
-    ? launched
-    : intents.map((intent) => ({ intent, microvmId: undefined }))) {
+  const applied: Array<{ launch: PlannedLaunch; microvmId?: string; status?: AwsSlotStatus }> =
+    launched.length > 0 ? launched : launches.map((item) => ({ launch: item }));
+  for (const { launch, microvmId, status } of applied) {
+    const slotStatus = status ?? "launching";
     next = upsertSlot(next, {
-      poolName: intent.poolName,
-      workerName: intent.workerName,
-      status: "launching",
-      requestId: intent.requestId,
-      repoUrls: intent.repoUrls,
-      launchedAtMs: nowMs,
+      poolName: launch.spec.poolName,
+      slotIndex: launch.slotIndex,
+      containerName: launch.containerName,
+      workerName: launch.spec.workerName,
+      running: runningFromMicrovmStatus(slotStatus),
+      status: slotStatus,
+      lastLaunchAtMs: nowMs,
       microvmId,
+      requestId: launch.spec.requestId,
+      repoUrls: [...launch.spec.repoUrls],
+      mode: launch.spec.mode,
     });
-    if (intent.mode === "serve" && intent.repoUrls.length > 0) {
-      next = {
-        ...next,
-        poolMeta: {
-          ...next.poolMeta,
-          [intent.poolName]: {
-            hasServedWork: true,
-            lastServedRepos: intent.repoUrls,
-          },
-        },
-      };
+    if (launch.spec.requestId) {
+      next.requestLaunchTimes[launch.spec.requestId] = nowMs;
     }
   }
   return next;
 }
 
-export function gcSlots(store: SlotStore, nowMs: number, maxAgeMs: number): SlotStore {
+export function gcSlots(store: SlotStore, nowMs: number): SlotStore {
   return {
     ...store,
-    slots: store.slots.filter((slot) => {
-      if (slot.status === "stopping") {
-        return nowMs - slot.launchedAtMs < maxAgeMs;
-      }
-      return true;
-    }),
-    cooldowns: expireCooldowns(store.cooldowns, nowMs),
+    slots: store.slots.filter((slot) => slot.status !== "stopped"),
+    requestLaunchTimes: pruneRequestLaunchTimes(store.requestLaunchTimes, nowMs),
   };
 }
 
-export function servedRecord(store: SlotStore): Record<string, PoolMeta> {
-  return store.poolMeta;
+export function findSlot(store: SlotStore, poolName: string, slotIndex: number): AwsSlot | undefined {
+  const containerName = containerNameForSlot(poolName, slotIndex);
+  return store.slots.find((slot) => slot.poolName === poolName && slot.containerName === containerName);
 }
 
 export function memoryStore(initial?: SlotStore): {
@@ -124,3 +135,5 @@ export function memoryStore(initial?: SlotStore): {
     },
   };
 }
+
+export { REQUEST_RECORD_TTL_MS };

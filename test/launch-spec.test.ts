@@ -6,19 +6,19 @@ import {
   internetEgressArn,
   runMicrovmParams,
 } from "../src/launch-spec.js";
-import type { LaunchIntent, SlotSnapshot } from "../src/types.js";
+import type { LaunchSpec } from "../src/types.js";
+import type { AwsSlot } from "../src/slot-state.js";
 
-const intent: LaunchIntent = {
+const spec: LaunchSpec = {
   mode: "serve",
   poolName: "gpu",
-  workerName: "pw_abc",
+  workerName: "aws-gpu-0",
   requestId: "bc-1",
   repoUrls: ["https://github.com/acme/app"],
-  reason: "test",
 };
 
 const base = {
-  intent,
+  spec,
   imageIdentifier: "arn:aws:lambda:us-east-1:123:microvm-image:cursor-worker",
   executionRoleArn: "arn:aws:iam::123:role/microvm",
   cursorApiKeyParamName: "/cursor-lambda-workers/cursor-api-key",
@@ -34,7 +34,7 @@ describe("buildRunHookPayload", () => {
     const payload = buildRunHookPayload(base);
     expect(payload.version).toBe("1");
     expect(payload.worker.cursorApiKeyParamName).toBe("/cursor-lambda-workers/cursor-api-key");
-    expect(payload.worker.workerId).toBe("pw_abc");
+    expect(payload.worker.workerId).toBe("aws-gpu-0");
     expect(JSON.stringify(payload)).not.toMatch(/sk-[a-zA-Z0-9]{8,}/);
     expect(() => assertNoSecrets(payload)).not.toThrow();
   });
@@ -42,29 +42,32 @@ describe("buildRunHookPayload", () => {
 
 describe("buildLaunchSpec", () => {
   it("builds a RunMicrovm launch with internet egress", () => {
-    const spec = buildLaunchSpec(base);
-    expect(spec.action).toBe("launch");
-    expect(spec.egressNetworkConnectors).toContain(internetEgressArn("us-east-1"));
-    expect(spec.maximumDurationInSeconds).toBe(28_800);
-    const params = runMicrovmParams(spec);
+    const built = buildLaunchSpec(base);
+    expect(built.action).toBe("launch");
+    expect(built.egressNetworkConnectors).toContain(internetEgressArn("us-east-1"));
+    expect(built.maximumDurationInSeconds).toBe(28_800);
+    const params = runMicrovmParams(built);
     expect(params.imageIdentifier).toBe(base.imageIdentifier);
     expect(params.runHookPayload).toContain("cursorApiKeyParamName");
     expect(params.maximumDurationInSeconds).toBe(28_800);
   });
 
-  it("prefers resuming a free suspended slot over a new launch", () => {
-    const slots: SlotSnapshot[] = [
+  it("resumes a stopped MicroVM on the same slot index", () => {
+    const slots: AwsSlot[] = [
       {
         poolName: "gpu",
-        workerName: "pw_old",
-        status: "suspended",
+        slotIndex: 0,
+        containerName: "pool=gpu/slot=0",
+        workerName: "aws-gpu-0",
+        running: false,
+        status: "stopped",
         repoUrls: ["https://github.com/acme/app"],
-        launchedAtMs: 1,
+        lastLaunchAtMs: 1,
         microvmId: "microvm-123",
       },
     ];
-    const spec = buildLaunchSpec(base, slots);
-    expect(spec.action).toBe("resume");
-    expect(spec.microvmId).toBe("microvm-123");
+    const built = buildLaunchSpec(base, slots, 0);
+    expect(built.action).toBe("resume");
+    expect(built.microvmId).toBe("microvm-123");
   });
 });

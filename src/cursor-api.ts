@@ -1,17 +1,40 @@
 /**
  * Cursor private-worker HTTP client. Platform-free (no AWS imports).
  *
- * Auth matches the public fleet-management docs: Basic with the service
- * account API key as the username and an empty password.
+ * Auth matches the Cloudflare reference: `Authorization: Bearer <key>`.
  */
 
-import type { ClaimResult, PendingRequest, PendingRequestsPage } from "./types.js";
+import type { PendingRequest } from "./types.js";
 import { canonicalizeUrl } from "./url.js";
 
 export interface CursorApiOptions {
   apiUrl: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
+}
+
+export interface PendingRequestsPage {
+  requests: PendingRequest[];
+  nextPageToken?: string;
+  totalCount?: number;
+}
+
+export interface PrivateWorker {
+  id?: string;
+  workerId?: string;
+  poolName?: string;
+  isInUse?: boolean;
+  activeBcId?: string;
+}
+
+export interface PrivatePool {
+  name?: string;
+  repos?: string[];
+}
+
+export interface ClaimResult {
+  bcId: string;
+  workerId: string;
 }
 
 export class CursorApiError extends Error {
@@ -26,10 +49,6 @@ export class CursorApiError extends Error {
   }
 }
 
-function basicAuth(apiKey: string): string {
-  return `Basic ${Buffer.from(`${apiKey}:`, "utf8").toString("base64")}`;
-}
-
 function joinUrl(base: string, path: string, query?: Record<string, string | undefined>): string {
   const url = canonicalizeUrl(`${base.replace(/\/+$/, "")}${path}`);
   if (query) {
@@ -40,6 +59,29 @@ function joinUrl(base: string, path: string, query?: Record<string, string | und
     }
   }
   return url.toString();
+}
+
+function normalizePendingRequest(raw: Record<string, unknown>): PendingRequest {
+  const labelsRaw = Array.isArray(raw.labels) ? raw.labels : [];
+  const labels = labelsRaw
+    .filter((label): label is { key: string; value: string } => {
+      return Boolean(label && typeof label === "object" && "key" in label && "value" in label);
+    })
+    .map((label) => ({ key: String(label.key), value: String(label.value) }));
+  const createdAtMs =
+    typeof raw.createdAtMs === "number"
+      ? raw.createdAtMs
+      : typeof raw.createdAt === "string"
+        ? Date.parse(raw.createdAt) || 0
+        : 0;
+  return {
+    id: String(raw.id ?? ""),
+    repoOwner: typeof raw.repoOwner === "string" ? raw.repoOwner : undefined,
+    repoName: typeof raw.repoName === "string" ? raw.repoName : undefined,
+    repoUrl: typeof raw.repoUrl === "string" ? raw.repoUrl : undefined,
+    labels,
+    createdAtMs,
+  };
 }
 
 export class CursorApiClient {
@@ -57,11 +99,19 @@ export class CursorApiClient {
   private async request(path: string, init: RequestInit = {}, query?: Record<string, string | undefined>): Promise<Response> {
     const url = joinUrl(this.apiUrl, path, query);
     const headers = new Headers(init.headers);
-    headers.set("Authorization", basicAuth(this.apiKey));
+    headers.set("Authorization", `Bearer ${this.apiKey}`);
     if (init.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
     return this.fetchImpl(url, { ...init, headers });
+  }
+
+  private async readOk(response: Response, label: string): Promise<string> {
+    const body = await response.text();
+    if (!response.ok) {
+      throw new CursorApiError(`${label} failed: ${response.status}`, response.status, body);
+    }
+    return body;
   }
 
   async listPendingRequestsPage(options: {
@@ -73,31 +123,25 @@ export class CursorApiClient {
       "/v0/private-workers/pending-requests",
       { method: "GET" },
       {
-        limit: String(options.limit ?? 50),
+        limit: String(options.limit ?? 100),
         pageToken: options.pageToken,
         repository: options.repository,
       },
     );
-    const body = await response.text();
-    if (!response.ok) {
-      throw new CursorApiError(
-        `GET /v0/private-workers/pending-requests failed: ${response.status}`,
-        response.status,
-        body,
-      );
-    }
-    const parsed = body ? (JSON.parse(body) as PendingRequestsPage) : { requests: [] };
+    const body = await this.readOk(response, "GET /v0/private-workers/pending-requests");
+    const parsed = body ? (JSON.parse(body) as { requests?: Record<string, unknown>[]; nextPageToken?: string; totalCount?: number }) : {};
     return {
-      requests: parsed.requests ?? [],
+      requests: (parsed.requests ?? []).map((item) => normalizePendingRequest(item)),
       nextPageToken: parsed.nextPageToken || undefined,
       totalCount: parsed.totalCount,
     };
   }
 
-  async listAllPendingRequests(options: { repository?: string; maxPages?: number } = {}): Promise<PendingRequest[]> {
+  /** Cloudflare client: up to 5 pages of 100. */
+  async listPendingRequests(options: { repository?: string; maxPages?: number } = {}): Promise<PendingRequest[]> {
     const requests: PendingRequest[] = [];
     let pageToken: string | undefined;
-    const maxPages = options.maxPages ?? 20;
+    const maxPages = options.maxPages ?? 5;
     for (let page = 0; page < maxPages; page += 1) {
       const result = await this.listPendingRequestsPage({
         limit: 100,
@@ -113,10 +157,23 @@ export class CursorApiClient {
     return requests;
   }
 
+  async listWorkers(): Promise<PrivateWorker[]> {
+    const response = await this.request("/v0/private-workers", { method: "GET" });
+    const body = await this.readOk(response, "GET /v0/private-workers");
+    const parsed = body ? (JSON.parse(body) as { workers?: PrivateWorker[] } | PrivateWorker[]) : [];
+    return Array.isArray(parsed) ? parsed : (parsed.workers ?? []);
+  }
+
+  async listPools(): Promise<PrivatePool[]> {
+    const response = await this.request("/v0/private-workers/pools", { method: "GET" });
+    const body = await this.readOk(response, "GET /v0/private-workers/pools");
+    const parsed = body ? (JSON.parse(body) as { pools?: PrivatePool[] } | PrivatePool[]) : [];
+    return Array.isArray(parsed) ? parsed : (parsed.pools ?? []);
+  }
+
   /**
-   * Probe POST /v0/private-workers/claim. The backend still claims when a
-   * worker connects; this is an optional pre-claim. 404/405/501 mean the
-   * route is not live and we stop calling it for this process.
+   * Optional pre-claim probe. The backend still claims when a worker
+   * connects; 404/405/501 mean the route is not live.
    */
   async probeClaim(): Promise<boolean> {
     if (this.claimSupported !== undefined) {
@@ -130,7 +187,6 @@ export class CursorApiClient {
       this.claimSupported = false;
       return false;
     }
-    // 400/409/401/403 all mean the route exists.
     this.claimSupported = true;
     return true;
   }

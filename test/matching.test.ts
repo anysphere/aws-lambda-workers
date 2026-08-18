@@ -1,256 +1,241 @@
 import { describe, expect, it } from "vitest";
-import { loadPlannerSettings, resolvePools } from "../src/config.js";
 import {
-  applyLaunchCooldowns,
-  matchingPools,
+  DEFAULT_POOL_NAME,
+  LAUNCH_COOLDOWN_MS,
+  REQUEST_RECORD_TTL_MS,
+  containerNameForBroadcast,
+  containerNameForSlot,
+  planBroadcastLaunch,
   planLaunches,
-  requestHasRepo,
-  requestRepoUrl,
+  planWarmLaunches,
+  poolNameFromRequest,
+  pruneRequestLaunchTimes,
+  repoKeyFromOwnerName,
+  repoKeyFromUrl,
+  repoUrlsForLaunch,
+  requestMatchesPool,
+  reservedContainerNames,
 } from "../src/matching.js";
-import type { CooldownState, PendingRequest, PlanInput, ResolvedPool, SlotSnapshot } from "../src/types.js";
+import type { PendingRequest, PoolConfig, SlotState } from "../src/types.js";
 
-function pool(overrides: Partial<ResolvedPool> = {}): ResolvedPool {
+function pool(overrides: Partial<PoolConfig> = {}): PoolConfig {
   return {
     name: "default",
     repos: ["https://github.com/acme/app"],
-    maxWorkers: 3,
-    minWorkers: 1,
-    hasServedWork: false,
-    lastServedRepos: [],
     ...overrides,
   };
 }
 
 function request(overrides: Partial<PendingRequest> = {}): PendingRequest {
   return {
-    id: "bc-11111111-1111-1111-1111-111111111111",
+    id: "bc-1",
     repoUrl: "https://github.com/acme/app",
-    labels: [{ key: "repo", value: "acme/app" }],
+    labels: [],
     createdAtMs: 1,
     ...overrides,
   };
 }
 
-function plan(overrides: Partial<PlanInput> = {}) {
-  const names = new Map<string, number>();
+function serve(overrides: Partial<Parameters<typeof planLaunches>[0]> = {}) {
   return planLaunches({
     pools: [pool()],
     pending: [request()],
-    slots: [],
-    cooldowns: { requestUntilMs: {}, poolLaunchAtMs: {} },
+    slotsByPool: {},
+    requestLaunchTimes: {},
     nowMs: 1_000_000,
-    launchCooldownMs: 60_000,
-    poolLaunchCooldownMs: 15_000,
-    createWorkerName: (mode, poolName, requestId) => {
-      const key = `${mode}:${poolName}:${requestId ?? ""}`;
-      const n = (names.get(key) ?? 0) + 1;
-      names.set(key, n);
-      return `pw_${mode}_${n}`;
-    },
+    maxWorkersPerPool: 3,
     ...overrides,
   });
 }
 
-describe("request matching helpers", () => {
-  it("extracts repo URLs from fields, labels, and owner/name", () => {
-    expect(requestRepoUrl(request())).toBe("https://github.com/acme/app");
+describe("repoKeyFromUrl / repoKeyFromOwnerName", () => {
+  it("normalizes https, ssh, git@, and .git suffixes to lowercase owner/name", () => {
+    expect(repoKeyFromUrl("https://github.com/Acme/App.git")).toBe("acme/app");
+    expect(repoKeyFromUrl("git@github.com:Acme/App.git")).toBe("acme/app");
+    expect(repoKeyFromUrl("ssh://git@github.com/Acme/App.git")).toBe("acme/app");
+    expect(repoKeyFromUrl("github.com/Acme/App")).toBe("acme/app");
+    expect(repoKeyFromOwnerName("Acme", "App")).toBe("acme/app");
+  });
+
+  it("keeps GitLab nested groups", () => {
+    expect(repoKeyFromUrl("https://gitlab.com/Group/Sub/Repo.git")).toBe("group/sub/repo");
+    expect(repoKeyFromUrl("git@gitlab.com:Group/Sub/Repo.git")).toBe("group/sub/repo");
+  });
+});
+
+describe("poolNameFromRequest / requestMatchesPool", () => {
+  it("targets pool default when the pool label is missing", () => {
+    expect(poolNameFromRequest(request({ labels: [] }))).toBe(DEFAULT_POOL_NAME);
+    expect(requestMatchesPool(request({ labels: [] }), pool({ name: "default" }))).toBe(true);
+    expect(requestMatchesPool(request({ labels: [] }), pool({ name: "gpu" }))).toBe(false);
+  });
+
+  it("never matches when the request has no resolvable repo", () => {
+    const unlabeled = request({ repoUrl: undefined, repoOwner: undefined, repoName: undefined });
+    expect(requestMatchesPool(unlabeled, pool())).toBe(false);
+    expect(requestMatchesPool(unlabeled, pool({ repos: [] }))).toBe(false);
+  });
+
+  it("requires request.repoUrl for an any-repo pool", () => {
+    const anyRepo = pool({ repos: [] });
     expect(
-      requestRepoUrl({
-        id: "bc-1",
-        repoOwner: "acme",
-        repoName: "payments",
-      }),
-    ).toBe("https://github.com/acme/payments");
-    expect(requestHasRepo({ id: "bc-2" })).toBe(false);
+      requestMatchesPool(request({ repoUrl: undefined, repoOwner: "acme", repoName: "app" }), anyRepo),
+    ).toBe(false);
+    expect(requestMatchesPool(request({ repoUrl: "https://github.com/acme/app" }), anyRepo)).toBe(true);
   });
 
-  it("matches a request to the pool that advertises the repo and pool label", () => {
-    const gpu = pool({ name: "gpu", repos: ["https://github.com/acme/app.git"] });
-    const other = pool({ name: "cpu", repos: ["https://github.com/acme/other"] });
+  it("matches a configured pool by repo key, not URL-string equality", () => {
+    const gpu = pool({ name: "gpu", repos: ["git@github.com:Acme/App.git"] });
     const req = request({
-      labels: [
-        { key: "repo", value: "acme/app" },
-        { key: "pool", value: "gpu" },
-      ],
+      repoUrl: "https://github.com/acme/app",
+      labels: [{ key: "pool", value: "gpu" }],
     });
-    expect(matchingPools([gpu, other], req).map((item) => item.name)).toEqual(["gpu"]);
+    expect(requestMatchesPool(req, gpu)).toBe(true);
+    expect(requestMatchesPool(req, pool({ name: "cpu" }))).toBe(false);
   });
 });
 
-describe("planLaunches serve / broadcast / warm", () => {
-  it("serves a repo-backed pending request", () => {
-    const result = plan();
-    expect(result.intents).toEqual([
-      expect.objectContaining({
+describe("repoUrlsForLaunch", () => {
+  it("clones the pool's full repo list when configured", () => {
+    const multi = pool({
+      repos: ["https://github.com/acme/app", "https://github.com/acme/lib"],
+    });
+    expect(repoUrlsForLaunch(request(), multi)).toEqual([
+      "https://github.com/acme/app",
+      "https://github.com/acme/lib",
+    ]);
+  });
+
+  it("falls back to the request repo for an any-repo pool", () => {
+    expect(repoUrlsForLaunch(request(), pool({ repos: [] }))).toEqual(["https://github.com/acme/app"]);
+  });
+});
+
+describe("planLaunches", () => {
+  it("serves the oldest request first on pool=<name>/slot=<n>", () => {
+    const launches = serve({
+      pending: [
+        request({ id: "bc-new", createdAtMs: 50 }),
+        request({ id: "bc-old", createdAtMs: 10 }),
+      ],
+    });
+    expect(launches.map((item) => item.spec.requestId)).toEqual(["bc-old", "bc-new"]);
+    expect(launches[0]).toMatchObject({
+      containerName: containerNameForSlot("default", 0),
+      slotIndex: 0,
+      spec: {
         mode: "serve",
-        poolName: "default",
-        requestId: "bc-11111111-1111-1111-1111-111111111111",
+        workerName: "aws-default-0",
         repoUrls: ["https://github.com/acme/app"],
-      }),
-    ]);
-  });
-
-  it("skips repo-less pending requests instead of serving them", () => {
-    const result = plan({ pending: [{ id: "bc-norepo" }] });
-    expect(result.intents.filter((intent) => intent.mode === "serve")).toEqual([]);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          requestId: "bc-norepo",
-          reason: expect.stringContaining("skip_no_repo"),
-        }),
-      ]),
-    );
-  });
-
-  it("does not serve a request that already has a launching slot", () => {
-    const slots: SlotSnapshot[] = [
-      {
-        poolName: "default",
-        workerName: "pw_existing",
-        status: "launching",
-        requestId: "bc-11111111-1111-1111-1111-111111111111",
-        repoUrls: ["https://github.com/acme/app"],
-        launchedAtMs: 1,
       },
-    ];
-    const result = plan({ slots });
-    expect(result.intents.filter((intent) => intent.mode === "serve")).toEqual([]);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: "already_assigned" })]),
-    );
+    });
   });
 
-  it("respects request launch cooldown", () => {
-    const cooldowns: CooldownState = {
-      requestUntilMs: { "bc-11111111-1111-1111-1111-111111111111": 2_000_000 },
-      poolLaunchAtMs: {},
-    };
-    const result = plan({ cooldowns, nowMs: 1_500_000 });
-    expect(result.intents.filter((intent) => intent.mode === "serve")).toEqual([]);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: "request_cooldown" })]),
-    );
-  });
-
-  it("respects maxWorkers capacity", () => {
-    const slots: SlotSnapshot[] = [0, 1, 2].map((i) => ({
-      poolName: "default",
-      workerName: `w${i}`,
-      status: "running" as const,
-      repoUrls: ["https://github.com/acme/app"],
-      launchedAtMs: 1,
-    }));
-    const result = plan({ slots, pools: [pool({ maxWorkers: 3, minWorkers: 0 })] });
-    expect(result.intents).toEqual([]);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: "pool_at_capacity" })]),
-    );
-  });
-
-  it("does not broadcast from a repo-less pool until it has served work", () => {
-    const sandbox = pool({
-      name: "sandbox",
-      repos: [],
-      hasServedWork: false,
-      minWorkers: 0,
+  it("does not serialize a pool: two matching requests can launch in one tick", () => {
+    const launches = serve({
+      pending: [request({ id: "bc-a", createdAtMs: 1 }), request({ id: "bc-b", createdAtMs: 2 })],
+      maxWorkersPerPool: 3,
     });
-    const result = plan({
-      pools: [sandbox],
-      pending: [{ id: "bc-empty", labels: [{ key: "pool", value: "sandbox" }] }],
-    });
-    expect(result.intents.filter((intent) => intent.mode === "broadcast")).toEqual([]);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ reason: "broadcast_blocked_until_pool_has_served_work" }),
-      ]),
-    );
-  });
-
-  it("broadcasts leftover repo-less demand after the pool has served", () => {
-    const sandbox = pool({
-      name: "sandbox",
-      repos: [],
-      hasServedWork: true,
-      lastServedRepos: ["https://github.com/acme/app"],
-      minWorkers: 0,
-    });
-    const result = plan({
-      pools: [sandbox],
-      pending: [{ id: "bc-empty", labels: [{ key: "pool", value: "sandbox" }] }],
-    });
-    expect(result.intents).toEqual([
-      expect.objectContaining({
-        mode: "broadcast",
-        poolName: "sandbox",
-        repoUrls: ["https://github.com/acme/app"],
-        requestId: "bc-empty",
-      }),
+    expect(launches).toHaveLength(2);
+    expect(launches.map((item) => item.containerName)).toEqual([
+      "pool=default/slot=0",
+      "pool=default/slot=1",
     ]);
   });
 
-  it("fills the warm floor when the pool has clone repos", () => {
-    const result = plan({
-      pending: [],
-      pools: [pool({ minWorkers: 2, maxWorkers: 3 })],
+  it("skips a request still inside LAUNCH_COOLDOWN_MS", () => {
+    const launches = serve({
+      requestLaunchTimes: { "bc-1": 1_000_000 - 1_000 },
+      nowMs: 1_000_000,
     });
-    expect(result.intents.filter((intent) => intent.mode === "warm")).toHaveLength(2);
+    expect(launches).toEqual([]);
   });
 
-  it("does not warm a repo-less pool that has never served", () => {
-    const result = plan({
-      pending: [],
-      pools: [pool({ repos: [], minWorkers: 1, hasServedWork: false })],
+  it("skips a slot still inside per-slot cooldown", () => {
+    const slots: SlotState[] = [{ slotIndex: 0, running: false, lastLaunchAtMs: 1_000_000 - 1_000 }];
+    const launches = serve({
+      slotsByPool: { default: slots },
+      maxWorkersPerPool: 1,
     });
-    expect(result.intents.filter((intent) => intent.mode === "warm")).toEqual([]);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: "warm_blocked_no_clone_repos" })]),
-    );
+    expect(launches).toEqual([]);
   });
-});
 
-describe("applyLaunchCooldowns", () => {
-  it("records per-request and per-pool cooldown timestamps", () => {
-    const next = applyLaunchCooldowns(
-      { requestUntilMs: {}, poolLaunchAtMs: {} },
-      [
-        {
-          mode: "serve",
-          poolName: "default",
-          workerName: "pw_1",
-          requestId: "bc-1",
-          repoUrls: ["https://github.com/acme/app"],
-          reason: "test",
-        },
-      ],
-      5_000,
-      60_000,
-    );
-    expect(next.requestUntilMs["bc-1"]).toBe(65_000);
-    expect(next.poolLaunchAtMs.default).toBe(5_000);
+  it("does not treat a running or suspended slot as free", () => {
+    const launches = serve({
+      slotsByPool: { default: [{ slotIndex: 0, running: true }] },
+      maxWorkersPerPool: 1,
+    });
+    expect(launches).toEqual([]);
+  });
+
+  it("uses the pool's full repo list on serve", () => {
+    const launches = serve({
+      pools: [pool({ repos: ["https://github.com/acme/app", "https://github.com/acme/lib"] })],
+    });
+    expect(launches[0]?.spec.repoUrls).toEqual([
+      "https://github.com/acme/app",
+      "https://github.com/acme/lib",
+    ]);
   });
 });
 
-describe("settings + matching integration", () => {
-  it("uses resolved pool caps from env-style settings", () => {
-    const settings = loadPlannerSettings({
-      POOLS: JSON.stringify([{ name: "default", repos: ["https://github.com/acme/app"] }]),
-      MAX_WORKERS_PER_POOL: "1",
-      MIN_WORKERS_PER_POOL: "0",
+describe("planWarmLaunches", () => {
+  it("fills the warm floor on pools that have repos", () => {
+    const warm = planWarmLaunches({
+      pools: [pool({ minWorkers: 2 })],
+      slotsByPool: {},
+      reservedContainerNames: new Set(),
+      nowMs: 1,
+      minWorkersPerPool: 1,
+      maxWorkersPerPool: 3,
     });
-    const result = planLaunches({
-      pools: resolvePools(settings),
-      pending: [request({ id: "bc-a" }), request({ id: "bc-b", repoUrl: "https://github.com/acme/app" })],
-      slots: [],
-      cooldowns: { requestUntilMs: {}, poolLaunchAtMs: {} },
-      nowMs: 10,
-      launchCooldownMs: 60_000,
-      poolLaunchCooldownMs: 0,
-      createWorkerName: (mode, _pool, id) => `${mode}-${id}`,
+    expect(warm).toHaveLength(2);
+    expect(warm.every((item) => item.spec.mode === "warm")).toBe(true);
+  });
+
+  it("skips pools with no repos", () => {
+    const warm = planWarmLaunches({
+      pools: [pool({ repos: [], minWorkers: 2 })],
+      slotsByPool: {},
+      reservedContainerNames: new Set(),
+      nowMs: 1,
+      minWorkersPerPool: 1,
+      maxWorkersPerPool: 3,
     });
-    expect(result.intents).toHaveLength(1);
-    expect(result.skipped).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: "pool_at_capacity" })]),
-    );
+    expect(warm).toEqual([]);
+  });
+
+  it("counts serve-reserved and running/suspended slots toward the floor", () => {
+    const serveLaunch = serve({ maxWorkersPerPool: 3 })[0];
+    const reserved = reservedContainerNames(serveLaunch ? [serveLaunch] : []);
+    const warm = planWarmLaunches({
+      pools: [pool({ minWorkers: 2 })],
+      slotsByPool: { default: [{ slotIndex: 1, running: true }] },
+      reservedContainerNames: reserved,
+      nowMs: 1,
+      minWorkersPerPool: 1,
+      maxWorkersPerPool: 3,
+    });
+    expect(warm).toEqual([]);
+  });
+});
+
+describe("broadcast helpers", () => {
+  it("names the one-off register boot pool=<name>/broadcast", () => {
+    expect(containerNameForBroadcast("gpu")).toBe("pool=gpu/broadcast");
+    expect(planBroadcastLaunch(pool({ name: "gpu" }))).toMatchObject({
+      containerName: "pool=gpu/broadcast",
+      slotIndex: -1,
+      spec: { mode: "broadcast", workerName: "aws-gpu-broadcast" },
+    });
+  });
+});
+
+describe("pruneRequestLaunchTimes", () => {
+  it("drops entries older than REQUEST_RECORD_TTL_MS", () => {
+    const now = REQUEST_RECORD_TTL_MS + 5_000;
+    const next = pruneRequestLaunchTimes({ fresh: now - 1_000, stale: 0 }, now);
+    expect(next).toEqual({ fresh: now - 1_000 });
+    expect(LAUNCH_COOLDOWN_MS).toBe(120_000);
   });
 });

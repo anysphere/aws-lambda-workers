@@ -1,112 +1,64 @@
 /**
- * Shared planner types. This file must stay free of AWS (and Cloudflare)
- * imports so the same matching tests can run in vitest.
+ * Shared types for the scheduler. This module is intentionally free of
+ * Cloudflare imports so the planning logic can be unit-tested under plain
+ * node/vitest.
  */
 
+/** One Cursor worker pool this deployment serves. */
+export interface PoolConfig {
+  /** Pool label registered by workers (`agent worker --pool --pool-name`). */
+  readonly name: string;
+  /**
+   * Repo clone URLs the pool's workers broadcast. Every worker launched for
+   * this pool clones all of these and registers one durable pool row per repo,
+   * so the pool shows up in the composer picker for each repo even at zero
+   * connected workers. Empty means "any repo": workers clone whatever repo the
+   * pending request references (or run repo-less when the request has none).
+   */
+  readonly repos: readonly string[];
+  /** Per-pool override of MAX_WORKERS_PER_POOL. */
+  readonly maxWorkers?: number;
+  /** Per-pool override of MIN_WORKERS_PER_POOL (warm floor). */
+  readonly minWorkers?: number;
+}
+
+/** A pending agent run returned by GET /v0/private-workers/pending-requests. */
+export interface PendingRequest {
+  readonly id: string;
+  readonly repoOwner?: string;
+  readonly repoName?: string;
+  readonly repoUrl?: string;
+  readonly labels: readonly { readonly key: string; readonly value: string }[];
+  readonly createdAtMs: number;
+}
+
+/** Scheduler-side view of one container slot. */
+export interface SlotState {
+  readonly slotIndex: number;
+  /** True when the container reports a running/healthy state. */
+  readonly running: boolean;
+  /** Last time the scheduler issued a launch for this slot, if any. */
+  readonly lastLaunchAtMs?: number;
+}
+
+/** What the container entrypoint is asked to do. */
 export type LaunchMode = "serve" | "broadcast" | "warm";
 
-export type SlotStatus = "launching" | "running" | "suspended" | "stopping";
-
-export interface PoolConfig {
-  name: string;
-  repos: string[];
-  maxWorkers?: number;
-  minWorkers?: number;
+/** Everything a container needs to boot one cursor-agent pool worker. */
+export interface LaunchSpec {
+  readonly mode: LaunchMode;
+  readonly poolName: string;
+  /** Repos to clone (and therefore broadcast) inside the container. */
+  readonly repoUrls: readonly string[];
+  /** Stable worker display name, useful in the Cursor dashboard. */
+  readonly workerName: string;
+  /** Pending request that triggered this launch (serve mode only). */
+  readonly requestId?: string;
 }
 
-export interface ResolvedPool extends PoolConfig {
-  maxWorkers: number;
-  minWorkers: number;
-  /** True after this pool has successfully served at least one repo-backed request. */
-  hasServedWork: boolean;
-  /** Repos cloned during the last successful serve; used for later broadcast/warm. */
-  lastServedRepos: string[];
-}
-
-export interface Label {
-  key: string;
-  value: string;
-}
-
-export interface PendingRequest {
-  id: string;
-  userId?: number | string;
-  serviceAccountId?: string;
-  repoOwner?: string;
-  repoName?: string;
-  repoUrl?: string;
-  labels?: Label[];
-  createdAtMs?: number;
-}
-
-export interface SlotSnapshot {
-  poolName: string;
-  workerName: string;
-  status: SlotStatus;
-  requestId?: string;
-  repoUrls: string[];
-  launchedAtMs: number;
-  microvmId?: string;
-}
-
-export interface CooldownState {
-  /** requestId -> cooldown-until epoch ms */
-  requestUntilMs: Record<string, number>;
-  /** poolName -> last launch epoch ms */
-  poolLaunchAtMs: Record<string, number>;
-}
-
-export interface LaunchIntent {
-  mode: LaunchMode;
-  poolName: string;
-  workerName: string;
-  requestId?: string;
-  repoUrls: string[];
-  reason: string;
-}
-
-export interface SkipReason {
-  requestId?: string;
-  poolName?: string;
-  reason: string;
-}
-
-export interface PlanInput {
-  pools: ResolvedPool[];
-  pending: PendingRequest[];
-  slots: SlotSnapshot[];
-  cooldowns: CooldownState;
-  nowMs: number;
-  launchCooldownMs: number;
-  poolLaunchCooldownMs: number;
-  /** Injected so tests can assert worker names. */
-  createWorkerName?: (mode: LaunchMode, poolName: string, requestId?: string) => string;
-}
-
-export interface PlanResult {
-  intents: LaunchIntent[];
-  skipped: SkipReason[];
-}
-
-export interface PlannerSettings {
-  pools: PoolConfig[];
-  maxWorkersPerPool: number;
-  minWorkersPerPool: number;
-  workerIdleReleaseTimeoutSeconds: number;
-  pollIntervalSeconds: number;
-  cursorApiUrl: string;
-  cursorAgentEndpoint: string;
-  launchCooldownMs: number;
-  poolLaunchCooldownMs: number;
-}
-
-export interface ClaimResult {
-  bcId: string;
-  workerId: string;
-}
-
-export interface PendingRequestsPage {
-  requests: PendingRequest[];
-  nextPageToken?: string;
-  totalCount?: number;
+/** A launch decision made by the planner. */
+export interface PlannedLaunch {
+  readonly containerName: string;
+  readonly spec: LaunchSpec;
+  readonly slotIndex: number;
 }
