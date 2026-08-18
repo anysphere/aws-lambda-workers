@@ -112,6 +112,9 @@ Resources:
         Target: es2022
         Sourcemap: false
         Format: esm
+        # npm ci (not `npm install --omit=dev`) so the esbuild devDependency
+        # is present in scratch/node_modules/.bin for the bundler.
+        UseNpmCi: true
         EntryPoints:
           - src/index.ts
     Properties:
