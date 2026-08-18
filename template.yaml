@@ -1,0 +1,373 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Cursor self-hosted pool workers on AWS Lambda MicroVMs. An EventBridge-scheduled
+  scheduler polls pending-requests and launches MicroVMs that run cursor-agent
+  as a long-lived outbound bridge.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cursor-lambda-workers
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}[a-z0-9]$"
+    Description: Lower-case name prefix for created resources.
+
+  ImageNamePrefix:
+    Type: String
+    Default: cursor-pool-worker
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9-_]{0,62}$"
+    Description: MicroVM image name prefix; build logs go to /aws/lambda/microvms/<image-name>.
+
+  MicroVmImageIdentifier:
+    Type: String
+    Default: cursor-pool-worker
+    Description: Name of the built MicroVM image the scheduler runs (resolved to a full ARN).
+
+  CursorApiKeyParamName:
+    Type: String
+    Default: /cursor-lambda-workers/cursor-api-key
+    Description: >-
+      SSM SecureString name for the Cursor service-account API key. CloudFormation
+      cannot create SecureString parameters; create this out-of-band after deploy.
+
+  GitTokenParamName:
+    Type: String
+    Default: /cursor-lambda-workers/git-token
+    Description: >-
+      Optional SSM SecureString name for a git HTTPS token. Leave unused if repos
+      are public. Create out-of-band with aws ssm put-parameter --type SecureString.
+
+  AdminToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Bearer token for /status and /tick. Generate a long random string.
+
+  Pools:
+    Type: String
+    Default: '[{"name":"default","repos":["https://github.com/YOUR_ORG/YOUR_REPO"]}]'
+    Description: JSON array of { name, repos, maxWorkers?, minWorkers? }.
+
+  MaxWorkersPerPool:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 50
+
+  MinWorkersPerPool:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 50
+
+  WorkerIdleReleaseTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 28800
+
+  PollIntervalSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 20
+    MaxValue: 300
+    Description: Planner interval. EventBridge minimum is 1 minute; values below 60 are documented only.
+
+  CursorApiUrl:
+    Type: String
+    Default: https://api.cursor.com
+
+  CursorAgentEndpoint:
+    Type: String
+    Default: https://api2.cursor.sh
+
+  ExtraIngressConnectorArn:
+    Type: String
+    Default: ""
+    Description: Optional extra Lambda Network Connector ARN (customer VPC ingress).
+
+  ExtraEgressConnectorArn:
+    Type: String
+    Default: ""
+    Description: Optional extra Lambda Network Connector ARN (customer VPC egress).
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 512
+
+Conditions:
+  HasExtraIngress: !Not [!Equals [!Ref ExtraIngressConnectorArn, ""]]
+  HasExtraEgress: !Not [!Equals [!Ref ExtraEgressConnectorArn, ""]]
+
+Resources:
+  SchedulerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        Format: esm
+        EntryPoints:
+          - src/index.ts
+    Properties:
+      FunctionName: !Sub "${ProjectName}-scheduler"
+      CodeUri: .
+      Handler: index.handler
+      Environment:
+        Variables:
+          SLOT_TABLE_NAME: !Ref SlotTable
+          MICROVM_IMAGE_IDENTIFIER: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
+          MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
+          CURSOR_API_KEY_PARAM_NAME: !Ref CursorApiKeyParamName
+          GIT_TOKEN_PARAM_NAME: !Ref GitTokenParamName
+          REPO_CACHE_BUCKET: !Ref ArtifactBucket
+          MICROVM_LOG_GROUP: !Sub "/aws/lambda/microvms/${ImageNamePrefix}"
+          POOLS: !Ref Pools
+          MAX_WORKERS_PER_POOL: !Ref MaxWorkersPerPool
+          MIN_WORKERS_PER_POOL: !Ref MinWorkersPerPool
+          WORKER_IDLE_RELEASE_TIMEOUT_SECONDS: !Ref WorkerIdleReleaseTimeoutSeconds
+          POLL_INTERVAL_SECONDS: !Ref PollIntervalSeconds
+          CURSOR_API_URL: !Ref CursorApiUrl
+          CURSOR_AGENT_ENDPOINT: !Ref CursorAgentEndpoint
+          ADMIN_TOKEN: !Ref AdminToken
+          EXTRA_INGRESS_CONNECTOR_ARN: !Ref ExtraIngressConnectorArn
+          EXTRA_EGRESS_CONNECTOR_ARN: !Ref ExtraEgressConnectorArn
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+            - "*"
+          AllowHeaders:
+            - Authorization
+            - X-Admin-Token
+          AllowMethods:
+            - GET
+            - POST
+      Events:
+        PollTick:
+          Type: Schedule
+          Properties:
+            # EventBridge rate() minimum is 1 minute. The planner itself is
+            # platform-free and can run faster if you invoke /tick.
+            Schedule: rate(1 minute)
+            Enabled: true
+            Name: !Sub "${ProjectName}-poll"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: "ssm:GetParameter"
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+            - Effect: Allow
+              Action: "kms:Decrypt"
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                  kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - "lambda:RunMicroVm"
+                - "lambda:ResumeMicrovm"
+                - "lambda:SuspendMicrovm"
+                - "lambda:TerminateMicrovm"
+              Resource: "*"
+            - Effect: Allow
+              Action: "iam:PassRole"
+              Resource: !GetAtt MicroVmExecutionRole.Arn
+            - Effect: Allow
+              Action: "lambda:PassNetworkConnector"
+              Resource:
+                - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
+                - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+                - !If
+                  - HasExtraIngress
+                  - !Ref ExtraIngressConnectorArn
+                  - !Ref AWS::NoValue
+                - !If
+                  - HasExtraEgress
+                  - !Ref ExtraEgressConnectorArn
+                  - !Ref AWS::NoValue
+            - Effect: Allow
+              Action:
+                - "dynamodb:GetItem"
+                - "dynamodb:PutItem"
+                - "dynamodb:UpdateItem"
+                - "dynamodb:DeleteItem"
+                - "dynamodb:Query"
+                - "dynamodb:Scan"
+              Resource: !GetAtt SlotTable.Arn
+
+  SlotTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-slots"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  MicroVmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-microvm-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"
+      Policies:
+        - PolicyName: read-cursor-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ssm:GetParameter"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitTokenParamName}"
+              - Effect: Allow
+                Action: "kms:Decrypt"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                  StringLike:
+                    kms:EncryptionContext:PARAMETER_ARN:
+                      - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+                      - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitTokenParamName}"
+        - PolicyName: optional-repo-cache
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:GetObject"
+                Resource: !Sub "${ArtifactBucket.Arn}/repo-cache/*"
+        - PolicyName: self-lifecycle
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:SuspendMicrovm"
+                  - "lambda:TerminateMicrovm"
+                Resource: "*"
+        - PolicyName: runtime-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*:*"
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"
+      Policies:
+        - PolicyName: artifact-bucket-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+        - PolicyName: build-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*:*"
+
+Outputs:
+  AdminUrl:
+    Description: Function URL for /health, /status, /tick (bearer ADMIN_TOKEN).
+    Value: !GetAtt SchedulerFunctionUrl.FunctionUrl
+  SchedulerFunctionArn:
+    Description: Scheduler Lambda ARN.
+    Value: !GetAtt SchedulerFunction.Arn
+  ArtifactBucketName:
+    Description: S3 bucket for the MicroVM image source (app.zip) and optional repo tarballs.
+    Value: !Ref ArtifactBucket
+  BuildRoleArn:
+    Description: Build role ARN passed to create-microvm-image.
+    Value: !GetAtt BuildRole.Arn
+  MicroVmExecutionRoleArn:
+    Description: Execution role each MicroVM assumes to read the Cursor API key.
+    Value: !GetAtt MicroVmExecutionRole.Arn
+  SlotTableName:
+    Description: DynamoDB table holding slot and cooldown state.
+    Value: !Ref SlotTable
+  CursorApiKeyParamName:
+    Description: Create this SSM SecureString with the Cursor service-account API key.
+    Value: !Ref CursorApiKeyParamName
+  GitTokenParamName:
+    Description: Optional SSM SecureString for a git HTTPS token.
+    Value: !Ref GitTokenParamName
