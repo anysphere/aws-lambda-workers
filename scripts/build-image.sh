@@ -72,5 +72,5 @@ echo
 echo "Image build started. Monitor build logs in CloudWatch:"
 echo "  /aws/lambda/microvms/${IMAGE_NAME}"
 echo "The image transitions CREATING -> CREATED (version SUCCESSFUL) on success."
-echo "Then update the stack if you used a different image name:"
-echo "  sam deploy --parameter-overrides MicroVmImageIdentifier=${IMAGE_NAME}"
+echo "Then export MICROVM_IMAGE_IDENTIFIER=${IMAGE_NAME} (or the image ARN)"
+echo "and point the shared controller at ./spawn.sh."

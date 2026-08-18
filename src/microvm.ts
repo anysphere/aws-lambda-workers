@@ -1,9 +1,6 @@
 /**
- * Thin lambda-microvms client.
- *
- * The service model is new enough that we sign REST calls ourselves rather
- * than requiring a matching @aws-sdk/client-lambda-microvms release on the
- * scheduler image.
+ * Thin lambda-microvms client. Signs REST calls so we do not depend on a
+ * matching @aws-sdk/client-lambda-microvms release.
  */
 
 import { Sha256 } from "@aws-crypto/sha256-js";
@@ -21,33 +18,45 @@ export interface LaunchedMicroVm {
 
 export interface MicroVmClient {
   launch(spec: MicrovmLaunchSpec): Promise<LaunchedMicroVm>;
-  resume(microvmId: string): Promise<void>;
-  suspend(microvmId: string): Promise<void>;
-  terminate(microvmId: string): Promise<void>;
 }
 
 export class LaunchMicroVmError extends Error {
-  constructor(
-    message: string,
-    readonly cause?: unknown,
-  ) {
+  readonly status?: number;
+  readonly retryable: boolean;
+
+  constructor(message: string, options: { status?: number; retryable?: boolean; cause?: unknown } = {}) {
     super(message);
     this.name = "LaunchMicroVmError";
+    this.status = options.status;
+    this.retryable = options.retryable ?? isRetryableStatus(options.status);
+    if (options.cause !== undefined) {
+      this.cause = options.cause;
+    }
   }
+}
+
+export function isRetryableStatus(status: number | undefined): boolean {
+  if (status === undefined) {
+    return true;
+  }
+  return status === 408 || status === 429 || status >= 500;
 }
 
 interface SignedClientOptions {
   region: string;
   fetchImpl?: typeof fetch;
+  credentials?: () => Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken?: string }>;
 }
 
 export class SignedMicroVmClient implements MicroVmClient {
   private readonly region: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly credentials: SignedClientOptions["credentials"];
 
   constructor(options: SignedClientOptions) {
     this.region = options.region;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.credentials = options.credentials ?? defaultProvider();
   }
 
   private endpointHost(): string {
@@ -70,7 +79,7 @@ export class SignedMicroVmClient implements MicroVmClient {
     const signer = new SignatureV4({
       service: MICROVM_SERVICE,
       region: this.region,
-      credentials: defaultProvider(),
+      credentials: this.credentials!,
       sha256: Sha256,
     });
     const signed = await signer.sign(request);
@@ -88,41 +97,27 @@ export class SignedMicroVmClient implements MicroVmClient {
   }
 
   async launch(spec: MicrovmLaunchSpec): Promise<LaunchedMicroVm> {
-    if (spec.action === "resume" && spec.microvmId) {
-      await this.resume(spec.microvmId);
-      return { microvmId: spec.microvmId };
-    }
     const params = runMicrovmParams(spec);
-    const response = await this.signedFetch("POST", "/microvms", params);
+    let response: Response;
+    try {
+      response = await this.signedFetch("POST", "/microvms", params);
+    } catch (error) {
+      throw new LaunchMicroVmError(`RunMicrovm network error: ${error instanceof Error ? error.message : error}`, {
+        retryable: true,
+        cause: error,
+      });
+    }
     const text = await response.text();
     if (!response.ok) {
-      throw new LaunchMicroVmError(`RunMicrovm failed: ${response.status} ${text}`, text);
+      throw new LaunchMicroVmError(`RunMicrovm failed: ${response.status} ${text}`, {
+        status: response.status,
+        cause: text,
+      });
     }
     const parsed = text ? (JSON.parse(text) as { microvmId?: string; endpoint?: string }) : {};
     if (!parsed.microvmId) {
-      throw new LaunchMicroVmError(`RunMicrovm response missing microvmId: ${text}`);
+      throw new LaunchMicroVmError(`RunMicrovm response missing microvmId: ${text}`, { retryable: true });
     }
     return { microvmId: parsed.microvmId, endpoint: parsed.endpoint };
-  }
-
-  async resume(microvmId: string): Promise<void> {
-    const response = await this.signedFetch("POST", `/microvms/${encodeURIComponent(microvmId)}/resume`);
-    if (!response.ok) {
-      throw new LaunchMicroVmError(`ResumeMicrovm failed: ${response.status} ${await response.text()}`);
-    }
-  }
-
-  async suspend(microvmId: string): Promise<void> {
-    const response = await this.signedFetch("POST", `/microvms/${encodeURIComponent(microvmId)}/suspend`);
-    if (!response.ok) {
-      throw new LaunchMicroVmError(`SuspendMicrovm failed: ${response.status} ${await response.text()}`);
-    }
-  }
-
-  async terminate(microvmId: string): Promise<void> {
-    const response = await this.signedFetch("POST", `/microvms/${encodeURIComponent(microvmId)}/terminate`);
-    if (!response.ok) {
-      throw new LaunchMicroVmError(`TerminateMicrovm failed: ${response.status} ${await response.text()}`);
-    }
   }
 }

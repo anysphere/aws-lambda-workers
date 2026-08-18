@@ -47,6 +47,22 @@ async function fetchParameter(name, region) {
   return value;
 }
 
+async function terminateSelf() {
+  const microvmId = process.env.AWS_LAMBDA_MICROVM_ID || process.env.MICROVM_ID;
+  if (!microvmId) {
+    console.warn("hooks: no MICROVM_ID; leaving platform idle policy to reclaim the VM");
+    return;
+  }
+  try {
+    const { LambdaMicrovmsClient, TerminateMicrovmCommand } = await import("@aws-sdk/client-lambda-microvms");
+    const client = new LambdaMicrovmsClient({});
+    await client.send(new TerminateMicrovmCommand({ microvmId }));
+    console.log(`hooks: terminated ${microvmId}`);
+  } catch (err) {
+    console.warn("hooks: TerminateMicrovm unavailable or failed", err);
+  }
+}
+
 function stopWorker(signal = "SIGTERM") {
   if (!workerChild || workerChild.killed) {
     return;
@@ -69,6 +85,8 @@ function startWorker(env) {
     if (workerChild === child) {
       workerChild = undefined;
     }
+    // Idle-release (or crash) should tear the one-shot MicroVM down.
+    terminateSelf().catch((err) => console.warn("hooks: terminate-on-exit failed", err));
   });
   workerChild = child;
   return child;
@@ -85,10 +103,13 @@ async function materializeRuntimeEnv(dispatch) {
   const region = dispatch.awsRegion || process.env.AWS_REGION || "us-east-1";
   const workerId = dispatch.workerId || dispatch.workerName || randomWorkerId();
   const paramName = dispatch.cursorApiKeyParamName || process.env.CURSOR_API_KEY_PARAM_NAME;
-  if (!paramName) {
-    throw new Error("cursorApiKeyParamName is required");
+  let apiKey = typeof dispatch.cursorApiKey === "string" ? dispatch.cursorApiKey : "";
+  if (!apiKey && paramName) {
+    apiKey = await fetchParameter(paramName, region);
   }
-  const apiKey = await fetchParameter(paramName, region);
+  if (!apiKey) {
+    throw new Error("cursorApiKey or cursorApiKeyParamName is required");
+  }
   let gitToken;
   if (dispatch.gitTokenParamName) {
     gitToken = await fetchParameter(dispatch.gitTokenParamName, region);
@@ -147,7 +168,7 @@ const server = http.createServer(async (req, res) => {
       case "run": {
         const raw = await readBody(req);
         const { dispatch } = parseRunEnvelope(raw);
-        if (!dispatch.poolName && !dispatch.cursorApiKeyParamName) {
+        if (!dispatch.poolName && !dispatch.cursorApiKeyParamName && !dispatch.cursorApiKey && !dispatch.workerName) {
           res.writeHead(400, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "invalid run payload" }));
           return;

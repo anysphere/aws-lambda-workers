@@ -18,19 +18,12 @@ fi
 
 python3 - <<'PY'
 import sys
-try:
-    import yaml
-except ImportError:
-    print("PyYAML not installed; checking that template.yaml is non-empty UTF-8", file=sys.stderr)
-    data = open("template.yaml", "rb").read()
-    data.decode("utf-8")
-    assert b"AWS::Serverless-2016-10-31" in data
-    print("template.yaml: basic checks passed (install SAM CLI for full validate)")
-    sys.exit(0)
-doc = yaml.safe_load(open("template.yaml"))
-assert doc["Transform"] == "AWS::Serverless-2016-10-31"
-assert "SchedulerFunction" in doc["Resources"]
-assert "SlotTable" in doc["Resources"]
-assert "MicroVmExecutionRole" in doc["Resources"]
-print("template.yaml: YAML structure ok")
+data = open("template.yaml", "rb").read()
+data.decode("utf-8")
+assert b"AWS::Serverless-2016-10-31" in data
+assert b"SpawnRole" in data
+assert b"MicroVmExecutionRole" in data
+assert b"SchedulerFunction" not in data
+assert b"SlotTable" not in data
+print("template.yaml: basic checks passed (install SAM CLI for full validate)")
 PY

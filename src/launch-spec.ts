@@ -1,13 +1,9 @@
 /**
- * Build the RunMicrovm / resume payload. Kept free of AWS SDK imports so
- * vitest can exercise the same JSON the scheduler sends.
+ * One-shot RunMicrovm payload for a controller-spawned worker.
  */
 
-import { MAX_RUN_LIFETIME_SECONDS } from "./config.js";
-import type { LaunchSpec } from "./types.js";
-import type { AwsSlot } from "./slot-state.js";
-
 export const RUN_HOOK_PAYLOAD_VERSION = "1";
+export const MAX_RUN_LIFETIME_SECONDS = 28_800;
 
 export interface IdlePolicySpec {
   maxIdleDurationSeconds: number;
@@ -15,19 +11,22 @@ export interface IdlePolicySpec {
   autoResumeEnabled: boolean;
 }
 
-export interface LaunchSpecInput {
-  spec: LaunchSpec;
-  imageIdentifier: string;
-  executionRoleArn: string;
-  cursorApiKeyParamName: string;
+export interface SpawnLaunchInput {
+  poolName: string;
+  workerName: string;
+  repoUrls: readonly string[];
+  requestId?: string;
+  userEmail?: string;
+  cursorApiKey?: string;
+  cursorApiKeyParamName?: string;
   gitTokenParamName?: string;
   repoCacheBucket?: string;
-  cursorApiUrl: string;
-  cursorAgentEndpoint: string;
+  cursorApiUrl?: string;
+  cursorAgentEndpoint?: string;
   idleReleaseTimeoutSeconds: number;
   awsRegion: string;
-  maximumDurationSeconds?: number;
-  idlePolicy?: IdlePolicySpec;
+  imageIdentifier: string;
+  executionRoleArn: string;
   ingressNetworkConnectors?: string[];
   egressNetworkConnectors?: string[];
   logGroup?: string;
@@ -41,37 +40,37 @@ export interface RunHookPayload {
     workerId: string;
     repoUrls: string[];
     requestId?: string;
-    mode: string;
-    cursorApiUrl: string;
-    cursorAgentEndpoint: string;
-    cursorApiKeyParamName: string;
+    userEmail?: string;
+    mode: "serve";
+    cursorApiKey?: string;
+    cursorApiKeyParamName?: string;
     gitTokenParamName?: string;
     repoCacheBucket?: string;
+    cursorApiUrl?: string;
+    cursorAgentEndpoint?: string;
     idleReleaseTimeoutSeconds: number;
     awsRegion: string;
   };
 }
 
 export interface MicrovmLaunchSpec {
-  action: "launch" | "resume";
-  imageIdentifier?: string;
-  microvmId?: string;
-  executionRoleArn?: string;
+  action: "launch";
+  imageIdentifier: string;
+  executionRoleArn: string;
   runHookPayload: string;
   maximumDurationInSeconds: number;
-  idlePolicy?: IdlePolicySpec;
-  ingressNetworkConnectors?: string[];
-  egressNetworkConnectors?: string[];
+  idlePolicy: IdlePolicySpec;
+  ingressNetworkConnectors: string[];
+  egressNetworkConnectors: string[];
   logging?: { cloudWatch: { logGroup: string } };
 }
 
 export const DEFAULT_IDLE_POLICY: IdlePolicySpec = {
-  // AWS idle is *inbound proxy* idle. Outbound cursor-agent bridges look
-  // idle to the platform even while connected. Default high so warm workers
-  // do not flap; the worker's --idle-release-timeout is the real idle clock.
+  // Inbound-proxy idle is not the worker clock. cursor-agent
+  // --idle-release-timeout exits the process; hooks then terminate the VM.
   maxIdleDurationSeconds: MAX_RUN_LIFETIME_SECONDS,
-  suspendedDurationSeconds: MAX_RUN_LIFETIME_SECONDS,
-  autoResumeEnabled: true,
+  suspendedDurationSeconds: 0,
+  autoResumeEnabled: false,
 };
 
 export function allIngressArn(region: string): string {
@@ -82,84 +81,39 @@ export function internetEgressArn(region: string): string {
   return `arn:aws:lambda:${region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS`;
 }
 
-export function buildRunHookPayload(input: LaunchSpecInput): RunHookPayload {
+export function buildRunHookPayload(input: SpawnLaunchInput): RunHookPayload {
   const worker: RunHookPayload["worker"] = {
-    poolName: input.spec.poolName,
-    workerName: input.spec.workerName,
-    workerId: input.spec.workerName,
-    repoUrls: [...input.spec.repoUrls],
-    mode: input.spec.mode,
-    cursorApiUrl: input.cursorApiUrl,
-    cursorAgentEndpoint: input.cursorAgentEndpoint,
-    cursorApiKeyParamName: input.cursorApiKeyParamName,
+    poolName: input.poolName,
+    workerName: input.workerName,
+    workerId: input.workerName,
+    repoUrls: [...input.repoUrls],
+    mode: "serve",
     idleReleaseTimeoutSeconds: input.idleReleaseTimeoutSeconds,
     awsRegion: input.awsRegion,
   };
-  if (input.spec.requestId) {
-    worker.requestId = input.spec.requestId;
+  if (input.requestId) worker.requestId = input.requestId;
+  if (input.userEmail) worker.userEmail = input.userEmail;
+  if (input.cursorApiKeyParamName) {
+    worker.cursorApiKeyParamName = input.cursorApiKeyParamName;
+  } else if (input.cursorApiKey) {
+    worker.cursorApiKey = input.cursorApiKey;
   }
-  if (input.gitTokenParamName) {
-    worker.gitTokenParamName = input.gitTokenParamName;
-  }
-  if (input.repoCacheBucket) {
-    worker.repoCacheBucket = input.repoCacheBucket;
-  }
+  if (input.gitTokenParamName) worker.gitTokenParamName = input.gitTokenParamName;
+  if (input.repoCacheBucket) worker.repoCacheBucket = input.repoCacheBucket;
+  if (input.cursorApiUrl) worker.cursorApiUrl = input.cursorApiUrl;
+  if (input.cursorAgentEndpoint) worker.cursorAgentEndpoint = input.cursorAgentEndpoint;
   return { version: RUN_HOOK_PAYLOAD_VERSION, worker };
 }
 
-export function assertNoSecrets(payload: unknown): void {
-  const serialized = JSON.stringify(payload);
-  const forbidden = ["CURSOR_API_KEY", "GIT_TOKEN", "ANTHROPIC_API_KEY"];
-  for (const key of forbidden) {
-    if (new RegExp(`"${key}"\\s*:\\s*"`).test(serialized) && !serialized.includes(`${key}_PARAM`)) {
-      throw new Error(`run hook payload must not contain ${key}`);
-    }
-    if (serialized.includes("key_") && /sk-[a-zA-Z0-9]{8,}/.test(serialized)) {
-      throw new Error("run hook payload looks like it contains a raw secret");
-    }
-  }
-}
-
-/**
- * Resume the planned slot when it already has a MicroVM that is not live.
- * Suspended slots count as running to the planner (warm floor), so this is
- * used when a previous VM is stopped / reusable on that same slot index.
- */
-export function chooseResumeSlot(spec: LaunchSpec, slotIndex: number, slots: AwsSlot[]): AwsSlot | undefined {
-  return slots.find(
-    (slot) =>
-      slot.poolName === spec.poolName &&
-      slot.slotIndex === slotIndex &&
-      Boolean(slot.microvmId) &&
-      !slot.running,
-  );
-}
-
-export function buildLaunchSpec(input: LaunchSpecInput, slots: AwsSlot[] = [], slotIndex = 0): MicrovmLaunchSpec {
+export function buildLaunchSpec(input: SpawnLaunchInput): MicrovmLaunchSpec {
   const payload = buildRunHookPayload(input);
-  assertNoSecrets(payload);
-  const runHookPayload = JSON.stringify(payload);
-  const resume = chooseResumeSlot(input.spec, slotIndex, slots);
-  const idlePolicy = input.idlePolicy ?? DEFAULT_IDLE_POLICY;
-  const maximumDurationInSeconds = input.maximumDurationSeconds ?? MAX_RUN_LIFETIME_SECONDS;
-
-  if (resume?.microvmId) {
-    return {
-      action: "resume",
-      microvmId: resume.microvmId,
-      runHookPayload,
-      maximumDurationInSeconds,
-      idlePolicy,
-    };
-  }
-
   return {
     action: "launch",
     imageIdentifier: input.imageIdentifier,
     executionRoleArn: input.executionRoleArn,
-    runHookPayload,
-    maximumDurationInSeconds,
-    idlePolicy,
+    runHookPayload: JSON.stringify(payload),
+    maximumDurationInSeconds: MAX_RUN_LIFETIME_SECONDS,
+    idlePolicy: DEFAULT_IDLE_POLICY,
     ingressNetworkConnectors: input.ingressNetworkConnectors ?? [allIngressArn(input.awsRegion)],
     egressNetworkConnectors: input.egressNetworkConnectors ?? [internetEgressArn(input.awsRegion)],
     logging: input.logGroup ? { cloudWatch: { logGroup: input.logGroup } } : undefined,
@@ -167,26 +121,15 @@ export function buildLaunchSpec(input: LaunchSpecInput, slots: AwsSlot[] = [], s
 }
 
 export function runMicrovmParams(spec: MicrovmLaunchSpec): Record<string, unknown> {
-  if (spec.action !== "launch" || !spec.imageIdentifier) {
-    throw new Error("runMicrovmParams requires a launch spec");
-  }
   const params: Record<string, unknown> = {
     imageIdentifier: spec.imageIdentifier,
     runHookPayload: spec.runHookPayload,
     maximumDurationInSeconds: spec.maximumDurationInSeconds,
+    executionRoleArn: spec.executionRoleArn,
+    idlePolicy: spec.idlePolicy,
+    ingressNetworkConnectors: spec.ingressNetworkConnectors,
+    egressNetworkConnectors: spec.egressNetworkConnectors,
   };
-  if (spec.executionRoleArn) {
-    params.executionRoleArn = spec.executionRoleArn;
-  }
-  if (spec.idlePolicy) {
-    params.idlePolicy = spec.idlePolicy;
-  }
-  if (spec.ingressNetworkConnectors) {
-    params.ingressNetworkConnectors = spec.ingressNetworkConnectors;
-  }
-  if (spec.egressNetworkConnectors) {
-    params.egressNetworkConnectors = spec.egressNetworkConnectors;
-  }
   if (spec.logging) {
     params.logging = spec.logging;
   }

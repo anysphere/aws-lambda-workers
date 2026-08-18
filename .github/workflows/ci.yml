@@ -17,14 +17,8 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run typecheck
-      # SAM's esbuild bundler searches PATH (and, with UseNpmCi, the
-      # lockfile-installed project dependency). Put the npm-ci binary first.
-      - run: echo "${GITHUB_WORKSPACE}/node_modules/.bin" >> "$GITHUB_PATH"
       - uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
       - run: sam validate --lint --template template.yaml
-      - run: |
-          command -v esbuild
-          esbuild --version
-          sam build
+      - run: sam build

@@ -2,13 +2,13 @@
   "name": "aws-lambda-workers",
   "version": "0.1.0",
   "private": true,
-  "description": "Template for running Cursor self-hosted pool workers on AWS Lambda MicroVMs",
+  "description": "Spawn script and MicroVM image for Cursor pool workers on AWS Lambda MicroVMs",
   "type": "module",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --noEmit",
+    "spawn": "tsx src/spawn.ts",
     "validate": "sam validate --lint --template template.yaml"
   },
   "engines": {
@@ -16,16 +16,13 @@
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",
-    "@aws-sdk/client-dynamodb": "^3.893.0",
-    "@aws-sdk/client-ssm": "^3.893.0",
     "@aws-sdk/credential-provider-node": "^3.893.0",
-    "@aws-sdk/lib-dynamodb": "^3.893.0",
     "@smithy/protocol-http": "^5.1.0",
     "@smithy/signature-v4": "^5.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
-    "esbuild": "^0.25.2",
+    "tsx": "^4.19.3",
     "typescript": "^5.8.2",
     "vitest": "^3.0.9"
   }
