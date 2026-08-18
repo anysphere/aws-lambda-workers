@@ -2,44 +2,39 @@
 
 A customer-owned **spawn script** and **MicroVM image** so [Cursor cloud agents](https://cursor.com/agents) run inside [Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html).
 
-Matching, polling, cooldowns, and warm floor live in the shared controller: [`anysphere/private-worker-controller`](https://github.com/anysphere/private-worker-controller). This repo only starts a MicroVM when that controller execs `spawn.sh`.
+Matching and polling live in the Cursor agent CLI (`agent worker controller`). This repo only starts a MicroVM when that command execs `spawn.sh`.
 
 ## How it fits
 
 ```mermaid
 flowchart LR
   User[cursor.com/agents] --> CursorAPI[Cursor private-worker API]
-  Controller[private-worker-controller] -->|GET pending-requests| CursorAPI
+  Controller["agent worker controller"] -->|GET pending-requests| CursorAPI
   Controller -->|exec spawn.sh| Spawn[spawn.sh]
   Spawn -->|RunMicrovm| MicroVM[Lambda MicroVM]
   MicroVM -->|cursor-agent worker start --pool| CursorAPI
   MicroVM -->|git clone| Git[Git host]
 ```
 
-1. Install and run the shared controller. Point `--spawn` at this repo's `spawn.sh`.
+1. Install the Cursor agent CLI and run `agent worker controller --spawn ./spawn.sh`.
 2. The controller decides when a worker is needed and execs the script with `CURSOR_*` env vars.
 3. `spawn.sh` calls **RunMicrovm** with a one-shot worker identity (`CURSOR_WORKER_NAME`) and **exits**. It does not wait for `cursor-agent`.
 4. The MicroVM `/run` hook clones the request repo and starts `cursor-agent worker start --pool`. Idle-release on the agent exits the process; the hook then terminates the MicroVM.
 
 ## Run the controller
 
-Clone the sibling controller next to this repo, then:
+After `npm install` and `sam deploy` (below):
 
 ```bash
-# from this repo, after npm install and sam deploy (below)
 export AWS_REGION=us-east-1
 export MICROVM_IMAGE_IDENTIFIER="arn:aws:lambda:us-east-1:ACCOUNT:microvm-image:cursor-pool-worker"
 export MICROVM_EXECUTION_ROLE_ARN="arn:aws:iam::ACCOUNT:role/cursor-lambda-workers-microvm-execution-role"
 # optional: MicroVM reads the key from SSM instead of the run-hook payload
 export CURSOR_API_KEY_PARAM_NAME=/cursor-lambda-workers/cursor-api-key
 
-npx tsx /path/to/private-worker-controller/src/cli.ts --spawn ./spawn.sh
-```
-
-Once it lands in the agent CLI, the same spawn script works as:
-
-```bash
 agent worker controller --spawn ./spawn.sh
+# equivalent:
+# cursor-agent worker controller --spawn ./spawn.sh
 ```
 
 `spawn.sh` uses `tsx` (via local `node_modules/.bin` or `npx`) to run `src/spawn.ts`.
@@ -92,7 +87,7 @@ The stack creates:
 
 It does **not** create a scheduler Lambda, EventBridge rule, or DynamoDB table.
 
-Assume SpawnRole (or attach the same permissions to the identity that runs the controller):
+Assume SpawnRole (or attach the same permissions to the identity that runs `agent worker controller`):
 
 ```bash
 aws sts assume-role --role-arn "$SPAWN_ROLE_ARN" --role-session-name cursor-spawn
@@ -114,7 +109,7 @@ aws ssm put-parameter --type SecureString \
 
 The script zips `microvm-image/` (Dockerfile at the zip root), uploads it to the artifact bucket, and calls `create-microvm-image` with lifecycle hooks enabled. Watch `/aws/lambda/microvms/cursor-pool-worker` until the version is `SUCCESSFUL`.
 
-Set `MICROVM_IMAGE_IDENTIFIER` to that image name or ARN before running the controller.
+Set `MICROVM_IMAGE_IDENTIFIER` to that image name or ARN before running `agent worker controller --spawn ./spawn.sh`.
 
 ### Image contents
 
@@ -131,7 +126,7 @@ Do not bake API keys, git tokens, or unique worker IDs into the snapshot.
 - A Cursor team plan with self-hosted pool workers and a **service-account API key**
 - Lambda MicroVMs in the target region (ARM64)
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) and AWS CLI v2 with the `lambda-microvms` model
-- The [private-worker-controller](https://github.com/anysphere/private-worker-controller) sibling
+- The Cursor agent CLI (`agent` or `cursor-agent`) with `worker controller`
 
 ## Development
 
@@ -144,7 +139,7 @@ npm run typecheck
 
 ## Limitations
 
-- This repo does not poll Cursor or plan capacity. Run the shared controller.
+- This repo does not poll Cursor or plan capacity. Run `agent worker controller --spawn ./spawn.sh`.
 - Released `cursor-agent` needs `--worker-dir` to be a git clone. The spawn client requires a repo URL (or owner/name).
 - MicroVMs are ARM64 with an 8 hour max lifetime.
 - `@aws-sdk/client-lambda-microvms` may lag the service model; spawn signs `lambda-microvms` requests directly.

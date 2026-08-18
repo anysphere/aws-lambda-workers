@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >-
   IAM and artifact bucket for Cursor pool workers on AWS Lambda MicroVMs.
-  The shared private-worker-controller execs spawn.sh; this stack does not
-  poll, schedule, or keep slot state.
+  `agent worker controller --spawn ./spawn.sh` execs spawn.sh; this stack
+  does not poll, schedule, or keep slot state.
 
 Parameters:
   ProjectName:

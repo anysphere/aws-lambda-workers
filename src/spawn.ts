@@ -1,6 +1,7 @@
 /**
- * Controller spawn client. Reads CURSOR_* env from private-worker-controller
- * (or `agent worker controller --spawn`) and submits one RunMicrovm.
+ * Spawn client for `agent worker controller --spawn ./spawn.sh`
+ * (or `cursor-agent worker controller --spawn ./spawn.sh`).
+ * Reads CURSOR_* env and submits one RunMicrovm.
  *
  * Returns quickly — it does not wait for cursor-agent to finish.
  *

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Executed by private-worker-controller (`--spawn ./spawn.sh`).
+# Executed by `agent worker controller --spawn ./spawn.sh`
+# (or `cursor-agent worker controller --spawn ./spawn.sh`).
 # Submits one Lambda MicroVM and returns immediately.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
