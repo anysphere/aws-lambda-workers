@@ -2,27 +2,28 @@
   "name": "aws-lambda-workers",
   "version": "0.1.0",
   "private": true,
-  "description": "Spawn script and MicroVM image for Cursor pool workers on AWS Lambda MicroVMs",
+  "description": "CloudFormation template: scheduled Lambda controller + MicroVM image for Cursor pool workers",
   "type": "module",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "spawn": "tsx src/spawn.ts",
-    "validate": "sam validate --lint --template template.yaml"
+    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.js",
+    "validate": "./scripts/validate-template.sh"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",
+    "@aws-sdk/client-ssm": "^3.893.0",
     "@aws-sdk/credential-provider-node": "^3.893.0",
     "@smithy/protocol-http": "^5.1.0",
     "@smithy/signature-v4": "^5.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
-    "tsx": "^4.19.3",
+    "esbuild": "^0.25.1",
     "typescript": "^5.8.2",
     "vitest": "^3.0.9"
   }

@@ -65,12 +65,12 @@ aws lambda-microvms create-microvm-image \
   --name "${IMAGE_NAME}" \
   --base-image-arn "${BASE_IMAGE_ARN}" \
   --build-role-arn "${BUILD_ROLE_ARN}" \
-  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":300,"validate":"ENABLED","validateTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":5,"resume":"ENABLED","resumeTimeoutInSeconds":5,"suspend":"ENABLED","suspendTimeoutInSeconds":5,"terminate":"ENABLED","terminateTimeoutInSeconds":5}}' \
+  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":300,"validate":"ENABLED","validateTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":5}}' \
   "${REGION_ARG[@]}"
 
 echo
 echo "Image build started. Monitor build logs in CloudWatch:"
 echo "  /aws/lambda/microvms/${IMAGE_NAME}"
 echo "The image transitions CREATING -> CREATED (version SUCCESSFUL) on success."
-echo "Then export MICROVM_IMAGE_IDENTIFIER=${IMAGE_NAME} (or the image ARN)"
-echo "and run: agent worker controller --spawn ./spawn.sh"
+echo "Then set MicroVmImageIdentifier=${IMAGE_NAME} (or the image ARN) on the stack"
+echo "and start an agent from cursor.com/agents against the pool."
