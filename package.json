@@ -2,13 +2,15 @@
   "name": "aws-lambda-workers",
   "version": "0.1.0",
   "private": true,
-  "description": "CloudFormation template: scheduled Lambda controller + MicroVM image for Cursor pool workers",
+  "description": "CloudFormation template: Lambda runs agent worker controller --spawn; MicroVM image runs cursor-agent worker start --pool",
   "type": "module",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.js",
+    "bundle": "npm run bundle:handler && npm run bundle:spawn",
+    "bundle:handler": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.js",
+    "bundle:spawn": "esbuild src/spawn.ts --bundle --platform=node --target=node22 --format=esm --banner:js='#!/usr/bin/env node' --outfile=dist/spawn.mjs",
     "validate": "./scripts/validate-template.sh"
   },
   "engines": {

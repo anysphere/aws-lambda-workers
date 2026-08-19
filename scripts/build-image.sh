@@ -59,18 +59,26 @@ echo "Packaging ${IMAGE_SRC} -> ${TMP_ZIP}..."
 echo "Uploading to s3://${BUCKET}/${S3_KEY}..."
 aws s3 cp "${TMP_ZIP}" "s3://${BUCKET}/${S3_KEY}" "${REGION_ARG[@]}"
 
-echo "Creating MicroVM image '${IMAGE_NAME}'..."
+POOL_NAME="${POOL_NAME:-default}"
+CURSOR_API_KEY_PARAM_NAME="${CURSOR_API_KEY_PARAM_NAME:-/cursor-lambda-workers/cursor-api-key}"
+ENV_VARS="POOL_NAME=${POOL_NAME},CURSOR_API_KEY_PARAM_NAME=${CURSOR_API_KEY_PARAM_NAME}"
+if [[ -n "${REPO_URL:-}" ]]; then
+  ENV_VARS="${ENV_VARS},REPO_URL=${REPO_URL}"
+fi
+
+echo "Creating MicroVM image '${IMAGE_NAME}' (no lifecycle-hook server)..."
 aws lambda-microvms create-microvm-image \
   --code-artifact "uri=s3://${BUCKET}/${S3_KEY}" \
   --name "${IMAGE_NAME}" \
   --base-image-arn "${BASE_IMAGE_ARN}" \
   --build-role-arn "${BUILD_ROLE_ARN}" \
-  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":300,"validate":"ENABLED","validateTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":5}}' \
+  --environment-variables "${ENV_VARS}" \
   "${REGION_ARG[@]}"
 
 echo
 echo "Image build started. Monitor build logs in CloudWatch:"
 echo "  /aws/lambda/microvms/${IMAGE_NAME}"
 echo "The image transitions CREATING -> CREATED (version SUCCESSFUL) on success."
-echo "Then set MicroVmImageIdentifier=${IMAGE_NAME} (or the image ARN) on the stack"
-echo "and start an agent from cursor.com/agents against the pool."
+echo "Then set MicroVmImageIdentifier=${IMAGE_NAME} (or the image ARN) on the stack."
+echo "The scheduled Lambda runs agent worker controller --spawn ./spawn.mjs."
+echo "Start an agent from cursor.com/agents against the pool."

@@ -1,0 +1,9 @@
+node_modules
+.git
+.github
+coverage
+.env
+.env.*
+*.pem
+packaged.yaml
+.aws-sam

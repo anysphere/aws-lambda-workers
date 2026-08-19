@@ -1,68 +1,90 @@
-import { apiUrl, loadSettings, type EnvLike } from "./config.js";
-import { tickOnce, type TickDeps } from "./controller.js";
-import { CursorApiClient } from "./cursor-api.js";
-import { SpawnLease } from "./lease.js";
-import { SignedMicroVmClient } from "./microvm.js";
-import { optionalSsmParameterReader, ssmParameterReader } from "./secrets.js";
-import type { TickResult } from "./types.js";
+/**
+ * Thin Lambda wrapper. Does not poll, claim, or plan — it execs the
+ * published CLI:
+ *   agent worker controller --spawn ./spawn.mjs
+ *
+ * EventBridge re-invokes this function. If the CLI is a long-running loop,
+ * Lambda timeout stops it and the next schedule starts a new process.
+ * Pass extra CLI flags via CURSOR_WORKER_CONTROLLER_ARGS (e.g. --once).
+ */
 
-let processLease: SpawnLease | undefined;
+import { spawn, type ChildProcess } from "node:child_process";
+import { join } from "node:path";
+import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 
-function leaseFor(ttlMs: number): SpawnLease {
-  if (!processLease) {
-    processLease = new SpawnLease(ttlMs);
+export interface ControllerEnv {
+  [key: string]: string | undefined;
+}
+
+export interface RunControllerOptions {
+  env?: ControllerEnv;
+  spawnImpl?: typeof spawn;
+  readApiKey?: (env: ControllerEnv) => Promise<string>;
+}
+
+export function controllerArgs(env: ControllerEnv = process.env): string[] {
+  const script = env.SPAWN_SCRIPT || join(process.cwd(), "spawn.mjs");
+  const extra = (env.CURSOR_WORKER_CONTROLLER_ARGS || "")
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return ["worker", "controller", "--spawn", script, ...extra];
+}
+
+export function agentBin(env: ControllerEnv = process.env): string {
+  return env.CURSOR_AGENT_BIN || "agent";
+}
+
+export async function readCursorApiKey(env: ControllerEnv): Promise<string> {
+  const inline = env.CURSOR_API_KEY?.trim();
+  if (inline) {
+    return inline;
   }
-  return processLease;
-}
-
-export async function createLiveDeps(
-  env: EnvLike = process.env,
-  fetchImpl: typeof fetch = fetch,
-): Promise<TickDeps> {
-  const settings = loadSettings(env);
-  const cursorApiKey = await ssmParameterReader(settings.awsRegion, settings.cursorApiKeyParamName)();
-  const gitToken = await optionalSsmParameterReader(settings.awsRegion, settings.gitTokenParamName)();
-  return {
-    settings,
-    cursorApiKey,
-    gitToken,
-    api: new CursorApiClient({
-      apiUrl: apiUrl(settings.cursorApiUrl),
-      apiKey: cursorApiKey,
-      fetchImpl,
-    }),
-    microvms: new SignedMicroVmClient({ region: settings.awsRegion }),
-    lease: leaseFor(settings.leaseTtlMs),
-  };
-}
-
-interface HttpResponse {
-  statusCode: number;
-  headers: Record<string, string>;
-  body: string;
-}
-
-function json(statusCode: number, body: unknown): HttpResponse {
-  return {
-    statusCode,
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  };
-}
-
-function requestPath(event: Record<string, unknown>): string {
-  return String(event.rawPath ?? event.path ?? "/").replace(/\/+$/, "") || "/";
-}
-
-export async function handler(event: unknown = {}): Promise<TickResult | { ok: true } | HttpResponse> {
-  if (event && typeof event === "object" && (event as { health?: boolean }).health === true) {
-    return { ok: true };
+  const name = env.CURSOR_API_KEY_PARAM_NAME?.trim();
+  if (!name) {
+    throw new Error("CURSOR_API_KEY or CURSOR_API_KEY_PARAM_NAME is required");
   }
-
-  const record = event && typeof event === "object" ? (event as Record<string, unknown>) : undefined;
-  if (record && (typeof record.rawPath === "string" || typeof record.path === "string")) {
-    return requestPath(record) === "/health" ? json(200, { ok: true }) : json(404, { error: "not_found" });
+  const region = env.AWS_REGION || env.AWS_DEFAULT_REGION || "us-east-1";
+  const client = new SSMClient({ region });
+  const result = await client.send(new GetParameterCommand({ Name: name, WithDecryption: true }));
+  const value = result.Parameter?.Value?.trim();
+  if (!value) {
+    throw new Error(`SSM parameter ${name} has no value`);
   }
+  return value;
+}
 
-  return tickOnce(await createLiveDeps());
+function waitForChild(child: ChildProcess): Promise<number> {
+  return new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code !== null) {
+        resolve(code);
+        return;
+      }
+      resolve(signal ? 1 : 0);
+    });
+  });
+}
+
+export async function runWorkerController(options: RunControllerOptions = {}): Promise<{ ok: true; exitCode: number }> {
+  const env = options.env ?? process.env;
+  const spawnImpl = options.spawnImpl ?? spawn;
+  const readApiKey = options.readApiKey ?? readCursorApiKey;
+  const apiKey = await readApiKey(env);
+  const bin = agentBin(env);
+  const args = controllerArgs(env);
+  const child = spawnImpl(bin, args, {
+    env: { ...env, CURSOR_API_KEY: apiKey },
+    stdio: "inherit",
+  });
+  const exitCode = await waitForChild(child);
+  if (exitCode !== 0) {
+    throw new Error(`${bin} ${args.join(" ")} exited ${exitCode}`);
+  }
+  return { ok: true, exitCode };
+}
+
+export async function handler(): Promise<{ ok: true; exitCode: number }> {
+  return runWorkerController();
 }

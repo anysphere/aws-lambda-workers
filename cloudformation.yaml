@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Cursor pool workers on AWS Lambda MicroVMs. A scheduled Lambda polls
-  pending-requests and launches one-shot MicroVMs. Apply this template;
-  then start an agent from cursor.com/agents against the pool.
+  Cursor pool workers on AWS Lambda MicroVMs. Apply this template. A scheduled
+  Lambda execs `agent worker controller --spawn ./spawn.mjs`; spawn.mjs calls
+  RunMicrovm. Start an agent from cursor.com/agents against the pool.
 
 Parameters:
   ProjectName:
@@ -10,24 +10,26 @@ Parameters:
     Default: cursor-lambda-workers
     AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}[a-z0-9]$"
 
+  ControllerImageUri:
+    Type: String
+    Description: ECR image URI for the Lambda that runs agent worker controller --spawn ./spawn.mjs. Build with ./scripts/build-controller.sh.
+
   PoolName:
     Type: String
     Default: default
     Description: Pool label workers register as (agent worker start --pool).
-
-  Concurrency:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 50
-    Description: Max in-flight MicroVM launches held by the in-process spawn lease.
 
   PollIntervalMinutes:
     Type: Number
     Default: 1
     MinValue: 1
     MaxValue: 60
-    Description: EventBridge schedule (minimum 1 minute).
+    Description: EventBridge schedule that re-invokes the CLI (minimum 1 minute).
+
+  WorkerControllerArgs:
+    Type: String
+    Default: ""
+    Description: Extra args for `agent worker controller` (for example --once when the CLI supports a one-tick mode).
 
   MicroVmImageIdentifier:
     Type: String
@@ -111,6 +113,25 @@ Resources:
               - "sts:AssumeRole"
               - "sts:TagSession"
       Policies:
+        - PolicyName: read-cursor-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ssm:GetParameter"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitTokenParamName}"
+              - Effect: Allow
+                Action: "kms:Decrypt"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                  StringLike:
+                    kms:EncryptionContext:PARAMETER_ARN:
+                      - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+                      - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitTokenParamName}"
         - PolicyName: runtime-logs
           PolicyDocument:
             Version: "2012-10-17"
@@ -233,19 +254,22 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${ProjectName}-controller"
-      Runtime: nodejs22.x
+      PackageType: Image
       Architectures:
         - arm64
-      Handler: index.handler
-      Timeout: 60
-      MemorySize: 512
+      Timeout: 900
+      MemorySize: 1024
       ReservedConcurrentExecutions: 1
       Role: !GetAtt ControllerRole.Arn
-      Code: dist/
+      Code:
+        ImageUri: !Ref ControllerImageUri
       Environment:
         Variables:
+          CURSOR_POOL: !Ref PoolName
           POOL_NAME: !Ref PoolName
-          CONCURRENCY: !Ref Concurrency
+          SPAWN_SCRIPT: /var/task/spawn.mjs
+          CURSOR_AGENT_BIN: /root/.local/bin/agent
+          CURSOR_WORKER_CONTROLLER_ARGS: !Ref WorkerControllerArgs
           MICROVM_IMAGE_IDENTIFIER: !If
             - ImageIsArn
             - !Ref MicroVmImageIdentifier
@@ -283,7 +307,7 @@ Resources:
 
 Outputs:
   ControllerFunctionName:
-    Description: Scheduled controller Lambda.
+    Description: Scheduled Lambda that execs agent worker controller --spawn ./spawn.mjs.
     Value: !Ref ControllerFunction
   ArtifactBucketName:
     Description: S3 bucket for MicroVM image source zips.
@@ -298,5 +322,5 @@ Outputs:
     Description: Start agents from cursor.com/agents against this pool.
     Value: !Ref PoolName
   CursorApiKeyParamName:
-    Description: SSM SecureString the controller reads each tick.
+    Description: SSM SecureString the Lambda reads for CURSOR_API_KEY.
     Value: !Ref CursorApiKeyParamName

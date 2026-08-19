@@ -1,6 +1,5 @@
 /**
- * One-shot RunMicrovm payload. Per-VM pool/repo/key cannot be image env
- * (those are snapshotted); AWS delivers this string to the image /run hook.
+ * One-shot RunMicrovm payload for a CLI-spawned worker.
  */
 
 export const RUN_HOOK_PAYLOAD_VERSION = "1";
@@ -15,27 +14,47 @@ export interface IdlePolicySpec {
 export interface SpawnLaunchInput {
   poolName: string;
   workerName: string;
-  repoUrl: string;
+  repoUrls: readonly string[];
   requestId?: string;
-  cursorApiKey: string;
-  gitToken?: string;
+  userEmail?: string;
+  cursorApiKey?: string;
+  cursorApiKeyParamName?: string;
+  gitTokenParamName?: string;
+  repoCacheBucket?: string;
   cursorApiUrl?: string;
   cursorAgentEndpoint?: string;
   idleReleaseTimeoutSeconds: number;
   awsRegion: string;
   imageIdentifier: string;
   executionRoleArn: string;
-  ingressNetworkConnectors: string[];
-  egressNetworkConnectors: string[];
+  ingressNetworkConnectors?: string[];
+  egressNetworkConnectors?: string[];
   logGroup?: string;
 }
 
 export interface RunHookPayload {
   version: string;
-  env: Record<string, string>;
+  worker: {
+    poolName: string;
+    workerName: string;
+    workerId: string;
+    repoUrls: string[];
+    requestId?: string;
+    userEmail?: string;
+    mode: "serve";
+    cursorApiKey?: string;
+    cursorApiKeyParamName?: string;
+    gitTokenParamName?: string;
+    repoCacheBucket?: string;
+    cursorApiUrl?: string;
+    cursorAgentEndpoint?: string;
+    idleReleaseTimeoutSeconds: number;
+    awsRegion: string;
+  };
 }
 
 export interface MicrovmLaunchSpec {
+  action: "launch";
   imageIdentifier: string;
   executionRoleArn: string;
   runHookPayload: string;
@@ -47,7 +66,7 @@ export interface MicrovmLaunchSpec {
 }
 
 export const DEFAULT_IDLE_POLICY: IdlePolicySpec = {
-  // Outbound pool workers do not trip inbound-proxy idle. The agent
+  // Inbound-proxy idle is not the worker clock. cursor-agent
   // --idle-release-timeout exits; maximumDurationInSeconds reaps the VM.
   maxIdleDurationSeconds: MAX_RUN_LIFETIME_SECONDS,
   suspendedDurationSeconds: 0,
@@ -63,31 +82,40 @@ export function internetEgressArn(region: string): string {
 }
 
 export function buildRunHookPayload(input: SpawnLaunchInput): RunHookPayload {
-  const env: Record<string, string> = {
-    POOL_NAME: input.poolName,
-    WORKER_NAME: input.workerName,
-    CURSOR_AGENT_WORKER_ID: input.workerName,
-    CURSOR_API_KEY: input.cursorApiKey,
-    REPO_URL: input.repoUrl,
-    IDLE_RELEASE_TIMEOUT_SECONDS: String(input.idleReleaseTimeoutSeconds),
-    AWS_REGION: input.awsRegion,
+  const worker: RunHookPayload["worker"] = {
+    poolName: input.poolName,
+    workerName: input.workerName,
+    workerId: input.workerName,
+    repoUrls: [...input.repoUrls],
+    mode: "serve",
+    idleReleaseTimeoutSeconds: input.idleReleaseTimeoutSeconds,
+    awsRegion: input.awsRegion,
   };
-  if (input.requestId) env.CURSOR_REQUEST_ID = input.requestId;
-  if (input.gitToken) env.GIT_TOKEN = input.gitToken;
-  if (input.cursorApiUrl) env.CURSOR_API_URL = input.cursorApiUrl;
-  if (input.cursorAgentEndpoint) env.CURSOR_AGENT_ENDPOINT = input.cursorAgentEndpoint;
-  return { version: RUN_HOOK_PAYLOAD_VERSION, env };
+  if (input.requestId) worker.requestId = input.requestId;
+  if (input.userEmail) worker.userEmail = input.userEmail;
+  if (input.cursorApiKeyParamName) {
+    worker.cursorApiKeyParamName = input.cursorApiKeyParamName;
+  } else if (input.cursorApiKey) {
+    worker.cursorApiKey = input.cursorApiKey;
+  }
+  if (input.gitTokenParamName) worker.gitTokenParamName = input.gitTokenParamName;
+  if (input.repoCacheBucket) worker.repoCacheBucket = input.repoCacheBucket;
+  if (input.cursorApiUrl) worker.cursorApiUrl = input.cursorApiUrl;
+  if (input.cursorAgentEndpoint) worker.cursorAgentEndpoint = input.cursorAgentEndpoint;
+  return { version: RUN_HOOK_PAYLOAD_VERSION, worker };
 }
 
 export function buildLaunchSpec(input: SpawnLaunchInput): MicrovmLaunchSpec {
+  const payload = buildRunHookPayload(input);
   return {
+    action: "launch",
     imageIdentifier: input.imageIdentifier,
     executionRoleArn: input.executionRoleArn,
-    runHookPayload: JSON.stringify(buildRunHookPayload(input)),
+    runHookPayload: JSON.stringify(payload),
     maximumDurationInSeconds: MAX_RUN_LIFETIME_SECONDS,
     idlePolicy: DEFAULT_IDLE_POLICY,
-    ingressNetworkConnectors: input.ingressNetworkConnectors,
-    egressNetworkConnectors: input.egressNetworkConnectors,
+    ingressNetworkConnectors: input.ingressNetworkConnectors ?? [allIngressArn(input.awsRegion)],
+    egressNetworkConnectors: input.egressNetworkConnectors ?? [internetEgressArn(input.awsRegion)],
     logging: input.logGroup ? { cloudWatch: { logGroup: input.logGroup } } : undefined,
   };
 }
