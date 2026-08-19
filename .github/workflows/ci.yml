@@ -16,6 +16,7 @@ jobs:
           test -f cloudformation.yaml
           test -f microvm-image/Dockerfile
           test -f microvm-image/entrypoint.sh
+          test -f microvm-image/hook.py
           test ! -f handler.mjs
           test ! -f spawn.mjs
           test ! -f package.json
@@ -25,3 +26,4 @@ jobs:
           ! grep -q "AWS::Lambda::Function" cloudformation.yaml
           ! grep -q "AWS::Events::Rule" cloudformation.yaml
           grep -q "aws lambda-microvms run-microvm" spawn.sh
+          grep -q -- "--run-hook-payload" spawn.sh

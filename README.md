@@ -12,7 +12,7 @@ agent worker controller --spawn ./spawn.sh
 
 (`cursor-agent worker controller --spawn ./spawn.sh` is the same CLI.) Then start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
 
-`spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) and returns. The image `ENTRYPOINT` execs `cursor-agent worker start --pool`.
+`spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) and forwards `CURSOR_*` (API key, worker name, user email/id, repo, pool, request id) as `--run-hook-payload`. A tiny `/run` hook exports those vars and starts `cursor-agent worker start --pool`.
 
 ## AWS resources
 
@@ -44,7 +44,8 @@ aws lambda-microvms create-microvm-image \
   --name cursor-pool-worker \
   --base-image-arn "${BASE}" \
   --build-role-arn "${BUILD_ROLE}" \
-  --environment-variables "POOL_NAME=default,CURSOR_API_KEY_PARAM_NAME=/cursor-lambda-workers/cursor-api-key"
+  --environment-variables "POOL_NAME=default,CURSOR_API_KEY_PARAM_NAME=/cursor-lambda-workers/cursor-api-key" \
+  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60}}'
 ```
 
 Assume `SpawnRoleArn` (or equivalent IAM) so `spawn.sh` can call `run-microvm`.

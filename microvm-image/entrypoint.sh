@@ -37,4 +37,9 @@ fi
 
 cd "${dest}"
 AGENT_BIN="$(command -v cursor-agent || command -v agent)"
-exec "${AGENT_BIN}" worker start --pool "${POOL_NAME}" --worker-dir "${dest}" --idle-release-timeout "${IDLE_RELEASE_TIMEOUT_SECONDS}"
+NAME_ARGS=()
+if [[ -n "${CURSOR_WORKER_NAME:-}" ]]; then
+  NAME_ARGS=(--name "${CURSOR_WORKER_NAME}")
+fi
+exec "${AGENT_BIN}" worker start --pool "${POOL_NAME}" --worker-dir "${dest}" \
+  --idle-release-timeout "${IDLE_RELEASE_TIMEOUT_SECONDS}" "${NAME_ARGS[@]}"
