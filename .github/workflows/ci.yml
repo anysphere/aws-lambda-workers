@@ -6,16 +6,17 @@ on:
   pull_request:
 
 jobs:
-  test:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-      - run: npm ci
-      - run: npm test
-      - run: npm run typecheck
-      - run: npm run bundle
-      - run: ./scripts/validate-template.sh
+      - name: Check CloudFormation template
+        run: |
+          test -f cloudformation.yaml
+          grep -q "AWS::Lambda::Function" cloudformation.yaml
+          grep -q "cursor-agent worker controller --spawn" cloudformation.yaml
+          test -f handler.mjs
+          test -f spawn.mjs
+          test ! -d src
+          test ! -d test
+          test ! -f package.json

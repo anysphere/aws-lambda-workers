@@ -1,15 +1,9 @@
 node_modules/
 dist/
-coverage/
 .aws-sam/
-packaged.yaml
-samconfig.toml
-*.tsbuildinfo
 .env
 .env.*
-!.env.example
 *.pem
 *.key
 .DS_Store
 app.zip
-/tmp/
