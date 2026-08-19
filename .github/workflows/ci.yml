@@ -10,13 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check CloudFormation template
+      - name: Template shape
         run: |
+          test -f spawn.sh
           test -f cloudformation.yaml
-          grep -q "AWS::Lambda::Function" cloudformation.yaml
-          grep -q "cursor-agent worker controller --spawn" cloudformation.yaml
-          test -f handler.mjs
-          test -f spawn.mjs
+          test -f microvm-image/Dockerfile
+          test -f microvm-image/entrypoint.sh
+          test ! -f handler.mjs
+          test ! -f spawn.mjs
+          test ! -f package.json
           test ! -d src
           test ! -d test
-          test ! -f package.json
+          test ! -d controller
+          ! grep -q "AWS::Lambda::Function" cloudformation.yaml
+          ! grep -q "AWS::Events::Rule" cloudformation.yaml
+          grep -q "aws lambda-microvms run-microvm" spawn.sh

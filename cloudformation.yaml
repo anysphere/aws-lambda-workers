@@ -1,30 +1,15 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: >-
-  Cursor pool workers on AWS Lambda MicroVMs. Apply this template, then start
-  an agent from cursor.com/agents. The Lambda execs
-  `cursor-agent worker controller --spawn ./spawn.mjs`.
+Description: IAM, S3, and build role for Cursor pool-worker Lambda MicroVMs.
 
 Parameters:
   ProjectName:
     Type: String
     Default: cursor-lambda-workers
     AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}[a-z0-9]$"
-  ControllerImageUri:
-    Type: String
-    Description: ECR image built from controller/Dockerfile (./deploy.sh).
-  PoolName:
-    Type: String
-    Default: default
-  MicroVmImageIdentifier:
-    Type: String
-    Default: cursor-pool-worker
   CursorApiKeyParamName:
     Type: String
     Default: /cursor-lambda-workers/cursor-api-key
-    Description: SSM SecureString for the Cursor service-account API key.
-
-Conditions:
-  ImageIsArn: !Equals [!Select [0, !Split [":", !Ref MicroVmImageIdentifier]], "arn"]
+    Description: SSM SecureString the MicroVM reads for CURSOR_API_KEY.
 
 Resources:
   ArtifactBucket:
@@ -89,28 +74,22 @@ Resources:
                 Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/*"
 
-  ControllerRole:
+  SpawnRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ProjectName}-controller-role"
+      RoleName: !Sub "${ProjectName}-spawn-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
-              Service: lambda.amazonaws.com
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: controller
+        - PolicyName: run-microvm
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
-                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-controller*"
-              - Effect: Allow
-                Action: ssm:GetParameter
-                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
               - Effect: Allow
                 Action: lambda:RunMicroVm
                 Resource: "*"
@@ -123,56 +102,12 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
 
-  ControllerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-controller"
-      PackageType: Image
-      Architectures: [arm64]
-      Timeout: 900
-      MemorySize: 1024
-      ReservedConcurrentExecutions: 1
-      Role: !GetAtt ControllerRole.Arn
-      Code:
-        ImageUri: !Ref ControllerImageUri
-      Environment:
-        Variables:
-          CURSOR_POOL: !Ref PoolName
-          CURSOR_AGENT_BIN: /root/.local/bin/agent
-          CURSOR_API_KEY: !Sub "{{resolve:ssm-secure:${CursorApiKeyParamName}}}"
-          CURSOR_API_KEY_PARAM_NAME: !Ref CursorApiKeyParamName
-          MICROVM_IMAGE_IDENTIFIER: !If
-            - ImageIsArn
-            - !Ref MicroVmImageIdentifier
-            - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
-          MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
-
-  PollRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub "${ProjectName}-poll"
-      ScheduleExpression: rate(1 minute)
-      State: ENABLED
-      Targets:
-        - Id: Controller
-          Arn: !GetAtt ControllerFunction.Arn
-
-  PollPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ControllerFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt PollRule.Arn
-
 Outputs:
-  ControllerFunctionName:
-    Value: !Ref ControllerFunction
   ArtifactBucketName:
     Value: !Ref ArtifactBucket
   BuildRoleArn:
     Value: !GetAtt BuildRole.Arn
   MicroVmExecutionRoleArn:
     Value: !GetAtt MicroVmExecutionRole.Arn
-  PoolName:
-    Value: !Ref PoolName
+  SpawnRoleArn:
+    Value: !GetAtt SpawnRole.Arn

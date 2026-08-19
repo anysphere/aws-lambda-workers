@@ -1,51 +1,50 @@
 # Cursor pool workers on AWS Lambda MicroVMs
 
-Apply this CloudFormation template, then start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
-
-The stack runs a scheduled Lambda that execs:
+`spawn.sh` starts a worker MicroVM. After the AWS resources exist, run:
 
 ```bash
-cursor-agent worker controller --spawn ./spawn.mjs
+export MICROVM_IMAGE_IDENTIFIER=arn:aws:lambda:REGION:ACCOUNT:microvm-image:cursor-pool-worker
+export MICROVM_EXECUTION_ROLE_ARN=arn:aws:iam::ACCOUNT:role/cursor-lambda-workers-microvm-execution-role
+export CURSOR_API_KEY=YOUR_SERVICE_ACCOUNT_KEY
+
+agent worker controller --spawn ./spawn.sh
 ```
 
-`spawn.mjs` calls **RunMicrovm**. The guest `ENTRYPOINT` execs `cursor-agent worker start --pool`. Do not run the CLI on your laptop.
+(`cursor-agent worker controller --spawn ./spawn.sh` is the same CLI.) Then start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
 
-## Deploy
+`spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) and returns. The image `ENTRYPOINT` execs `cursor-agent worker start --pool`.
 
-Store the service-account API key in SSM:
+## AWS resources
+
+Put the API key in SSM, then apply `cloudformation.yaml` (artifact bucket, image build role, MicroVM execution role, spawn role):
 
 ```bash
 aws ssm put-parameter --type SecureString \
   --name /cursor-lambda-workers/cursor-api-key \
   --value "YOUR_SERVICE_ACCOUNT_KEY"
-```
 
-Then:
-
-```bash
-./deploy.sh
-```
-
-That builds `controller/Dockerfile` (the published CLI plus `handler.mjs` / `spawn.mjs`), deploys `cloudformation.yaml`, and starts a MicroVM image build from `microvm-image/`. Equivalent:
-
-```bash
 aws cloudformation deploy \
   --template-file cloudformation.yaml \
   --stack-name cursor-lambda-workers \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    ControllerImageUri=ACCOUNT.dkr.ecr.REGION.amazonaws.com/cursor-lambda-workers-controller:TAG \
-    PoolName=default \
-    CursorApiKeyParamName=/cursor-lambda-workers/cursor-api-key \
-    MicroVmImageIdentifier=cursor-pool-worker
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
-After the MicroVM image is `SUCCESSFUL`, start an agent from cursor.com/agents against `PoolName`.
+Build the worker image from `microvm-image/` (needs the stack outputs):
 
-## Layout
+```bash
+BUCKET=$(aws cloudformation describe-stacks --stack-name cursor-lambda-workers \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" --output text)
+BUILD_ROLE=$(aws cloudformation describe-stacks --stack-name cursor-lambda-workers \
+  --query "Stacks[0].Outputs[?OutputKey=='BuildRoleArn'].OutputValue" --output text)
+BASE=$(aws lambda-microvms list-managed-microvm-images --query "items[0].imageArn" --output text)
+( cd microvm-image && zip -r /tmp/app.zip . )
+aws s3 cp /tmp/app.zip "s3://${BUCKET}/app.zip"
+aws lambda-microvms create-microvm-image \
+  --code-artifact "uri=s3://${BUCKET}/app.zip" \
+  --name cursor-pool-worker \
+  --base-image-arn "${BASE}" \
+  --build-role-arn "${BUILD_ROLE}" \
+  --environment-variables "POOL_NAME=default,CURSOR_API_KEY_PARAM_NAME=/cursor-lambda-workers/cursor-api-key"
+```
 
-- `cloudformation.yaml` — customer artifact
-- `handler.mjs` — exec the CLI
-- `spawn.mjs` — RunMicrovm
-- `controller/Dockerfile` — Lambda image that holds `cursor-agent`
-- `microvm-image/` — guest image (`cursor-agent worker start --pool`)
+Assume `SpawnRoleArn` (or equivalent IAM) so `spawn.sh` can call `run-microvm`.
