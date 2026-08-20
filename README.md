@@ -36,8 +36,6 @@ aws lambda-microvms create-microvm-image \
   --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60}}'
 ```
 
-To test a CLI off `main`, put a lab version (`YYYY.MM.DD-<sha7>`) in `microvm-image/cursor-agent-version` and rebuild the MicroVM image. Lab builds: [cursor.com/install?channel=lab](https://cursor.com/install?channel=lab), the `agent-cli.yml` GitHub Action on `main`, or `https://downloads.cursor.com/lab/<version>/linux/x64/agent-cli-package.tar.gz`. Leave the file empty for the prod installer.
-
 Then start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
 
 ## How it works

@@ -1,7 +1,6 @@
-# Optional Cursor agent-cli lab version (YYYY.MM.DD-<sha7>).
-# Leave empty / comments only to use the prod installer:
+# Optional agent version override.
+# Leave empty / comments only to use the production installer:
 #   curl -fsSL https://cursor.com/install | bash
-# Example: 2026.08.20-f582eb6
 #
 # This file ships in the create-microvm-image zip (AWS may not pass Docker --build-arg).
-# Put the version on its own line, rebuild the MicroVM image, then re-zip/upload.
+# Put a version string on its own line, rebuild the MicroVM image, then re-zip/upload.

@@ -6,7 +6,7 @@ RUN dnf install -y --setopt=install_weak_deps=0 \
       $(command -v curl >/dev/null 2>&1 || echo curl) && \
     dnf clean all
 
-# Optional: pin a lab/main CLI, e.g. 2026.08.20-f582eb6. Empty = prod installer.
+# Optional agent version override. Empty = production installer.
 # create-microvm-image zips this directory and may not pass --build-arg;
 # set the version in cursor-agent-version instead (ships in the zip).
 COPY cursor-agent-version /tmp/cursor-agent-version
