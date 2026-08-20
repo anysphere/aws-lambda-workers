@@ -6,9 +6,27 @@ RUN dnf install -y --setopt=install_weak_deps=0 \
       $(command -v curl >/dev/null 2>&1 || echo curl) && \
     dnf clean all
 
-RUN curl -fsSL https://cursor.com/install | bash && \
+# Optional: pin a lab/main CLI, e.g. 2026.08.20-f582eb6. Empty = prod installer.
+# create-microvm-image zips this directory and may not pass --build-arg;
+# set the version in cursor-agent-version instead (ships in the zip).
+COPY cursor-agent-version /tmp/cursor-agent-version
+ARG CURSOR_AGENT_VERSION=
+ARG CURSOR_AGENT_ARCH=x64
+RUN VERSION="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' /tmp/cursor-agent-version | sed -e '/^$/d' | head -n 1)" && \
+    VERSION="${VERSION:-${CURSOR_AGENT_VERSION:-}}" && \
+    ARCH="${CURSOR_AGENT_ARCH:-x64}" && \
+    if [ -n "${VERSION}" ]; then \
+      mkdir -p "/root/.local/share/cursor-agent/versions/${VERSION}" /root/.local/bin && \
+      curl -fsSL "https://downloads.cursor.com/lab/${VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
+        | tar --strip-components=1 -xzf - -C "/root/.local/share/cursor-agent/versions/${VERSION}" && \
+      ln -sf "/root/.local/share/cursor-agent/versions/${VERSION}/cursor-agent" /root/.local/bin/agent && \
+      ln -sf "/root/.local/share/cursor-agent/versions/${VERSION}/cursor-agent" /root/.local/bin/cursor-agent; \
+    else \
+      curl -fsSL https://cursor.com/install | bash; \
+    fi && \
     ln -sf /root/.local/bin/agent /usr/local/bin/agent && \
-    ln -sf /root/.local/bin/agent /usr/local/bin/cursor-agent
+    ln -sf /root/.local/bin/agent /usr/local/bin/cursor-agent && \
+    rm -f /tmp/cursor-agent-version
 
 ENV PATH="/root/.cursor/bin:/root/.local/bin:/usr/local/bin:${PATH}"
 WORKDIR /opt/cursor
