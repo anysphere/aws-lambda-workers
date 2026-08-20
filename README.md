@@ -1,22 +1,10 @@
 # Cursor pool workers on AWS Lambda MicroVMs
 
-`spawn.sh` starts a worker MicroVM. After the AWS resources exist, run:
+This template runs Cursor self-hosted pool workers inside Lambda MicroVMs (`aws lambda-microvms run-microvm`). It is not a 15-minute Lambda function.
 
-```bash
-export MICROVM_IMAGE_IDENTIFIER=arn:aws:lambda:REGION:ACCOUNT:microvm-image:cursor-pool-worker
-export MICROVM_EXECUTION_ROLE_ARN=arn:aws:iam::ACCOUNT:role/cursor-lambda-workers-microvm-execution-role
-export CURSOR_API_KEY=YOUR_SERVICE_ACCOUNT_KEY
+## Deploy
 
-agent worker controller --spawn ./spawn.sh
-```
-
-(`cursor-agent worker controller --spawn ./spawn.sh` is the same CLI.) Then start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
-
-`spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) and forwards `CURSOR_*` (API key, worker name, user email/id, repo, pool, request id) as `--run-hook-payload`. A tiny `/run` hook exports those vars and starts `cursor-agent worker start --pool`.
-
-## AWS resources
-
-Put the API key in SSM, then apply `cloudformation.yaml` (artifact bucket, image build role, MicroVM execution role, spawn role):
+Put the service-account API key in SSM, then apply `cloudformation.yaml` (artifact bucket, image build role, MicroVM execution role, spawn role):
 
 ```bash
 aws ssm put-parameter --type SecureString \
@@ -48,4 +36,22 @@ aws lambda-microvms create-microvm-image \
   --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60}}'
 ```
 
-Assume `SpawnRoleArn` (or equivalent IAM) so `spawn.sh` can call `run-microvm`.
+Then start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
+
+## How it works
+
+`spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) and returns. `--run-hook-payload` forwards `CURSOR_*` into the guest. The image ENTRYPOINT runs `cursor-agent worker start --pool`.
+
+## Alternative: run the controller locally
+
+After the stack and image exist, you can drive `spawn.sh` from a laptop instead of a hosted controller:
+
+```bash
+export MICROVM_IMAGE_IDENTIFIER=arn:aws:lambda:REGION:ACCOUNT:microvm-image:cursor-pool-worker
+export MICROVM_EXECUTION_ROLE_ARN=arn:aws:iam::ACCOUNT:role/cursor-lambda-workers-microvm-execution-role
+export CURSOR_API_KEY=YOUR_SERVICE_ACCOUNT_KEY
+
+agent worker controller --spawn ./spawn.sh --pool default
+```
+
+(`cursor-agent worker controller --spawn ./spawn.sh --pool default` is the same CLI.) `--pool` is required (or `--all-pools`). Assume `SpawnRoleArn` so `spawn.sh` can call `run-microvm`.
