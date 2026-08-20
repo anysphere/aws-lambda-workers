@@ -1,6 +1,6 @@
 # Cursor pool workers on AWS Lambda MicroVMs
 
-This template runs Cursor self-hosted pool workers inside Lambda MicroVMs (`aws lambda-microvms run-microvm`). It is not a 15-minute Lambda function.
+This template runs Cursor self-hosted pool workers inside Lambda MicroVMs (`aws lambda-microvms run-microvm`).
 
 ## Deploy
 
