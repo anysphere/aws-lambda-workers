@@ -44,14 +44,14 @@ Then start an agent from [cursor.com/agents](https://cursor.com/agents) against 
 
 ## Alternative: run the controller locally
 
-After the stack and image exist, you can drive `spawn.sh` from a laptop instead of a hosted controller:
+After the stack and image exist, you can drive `spawn.sh` directly, instead of through a lambda:
 
 ```bash
 export MICROVM_IMAGE_IDENTIFIER=arn:aws:lambda:REGION:ACCOUNT:microvm-image:cursor-pool-worker
 export MICROVM_EXECUTION_ROLE_ARN=arn:aws:iam::ACCOUNT:role/cursor-lambda-workers-microvm-execution-role
 export CURSOR_API_KEY=YOUR_SERVICE_ACCOUNT_KEY
 
-agent worker controller --spawn ./spawn.sh --pool default
+agent worker controller --spawn ./spawn.sh --pool default 
 ```
 
 (`cursor-agent worker controller --spawn ./spawn.sh --pool default` is the same CLI.) `--pool` is required (or `--all-pools`). Assume `SpawnRoleArn` so `spawn.sh` can call `run-microvm`.
