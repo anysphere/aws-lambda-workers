@@ -13,7 +13,10 @@ jobs:
       - name: Template shape
         run: |
           test -f spawn.sh
+          test -f deploy.sh
           test -f cloudformation.yaml
+          test -f controller/Dockerfile
+          test -f controller/handler.py
           test -f microvm-image/Dockerfile
           test -f microvm-image/entrypoint.sh
           test -f microvm-image/hook.py
@@ -22,8 +25,11 @@ jobs:
           test ! -f package.json
           test ! -d src
           test ! -d test
-          test ! -d controller
-          ! grep -q "AWS::Lambda::Function" cloudformation.yaml
-          ! grep -q "AWS::Events::Rule" cloudformation.yaml
+          grep -q "AWS::Lambda::Function" cloudformation.yaml
+          grep -q "AWS::Events::Rule" cloudformation.yaml
+          grep -q "ReservedConcurrentExecutions: 1" cloudformation.yaml
+          grep -q "rate(1 minute)" cloudformation.yaml
+          grep -q "CONTROLLER_RUN_SECONDS: \"300\"" cloudformation.yaml
+          grep -q "agent worker controller --spawn" controller/handler.py
           grep -q "aws lambda-microvms run-microvm" spawn.sh
           grep -q -- "--run-hook-payload" spawn.sh

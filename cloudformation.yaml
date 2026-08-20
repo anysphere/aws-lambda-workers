@@ -1,15 +1,34 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: IAM, S3, and build role for Cursor pool-worker Lambda MicroVMs.
+Description: >-
+  Cursor pool-worker Lambda MicroVMs plus a scheduled controller Lambda.
+  EventBridge rate(1 minute) keeps the controller available; each invoke runs
+  `agent worker controller --spawn ./spawn.sh` for 5 minutes (SSE poll window)
+  and exits. ReservedConcurrentExecutions is 1 so controllers never overlap.
+  Throttled ticks are dropped. A DLQ records a crash; the next schedule is the restart.
 
 Parameters:
   ProjectName:
     Type: String
     Default: cursor-lambda-workers
     AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}[a-z0-9]$"
+  ControllerImageUri:
+    Type: String
+    Description: ECR image URI for the controller Lambda (controller/Dockerfile). Build with ./deploy.sh.
+  PoolName:
+    Type: String
+    Default: default
+    Description: Pool label workers register as (`agent worker controller --pool` / `worker start --pool`).
+  MicroVmImageIdentifier:
+    Type: String
+    Default: cursor-pool-worker
+    Description: MicroVM image name or ARN that spawn.sh passes to RunMicrovm.
   CursorApiKeyParamName:
     Type: String
     Default: /cursor-lambda-workers/cursor-api-key
-    Description: SSM SecureString the MicroVM reads for CURSOR_API_KEY.
+    Description: SSM SecureString the controller and MicroVM read for CURSOR_API_KEY.
+
+Conditions:
+  ImageIsArn: !Equals [!Select [0, !Split [":", !Ref MicroVmImageIdentifier]], "arn"]
 
 Resources:
   ArtifactBucket:
@@ -102,7 +121,111 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
 
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-controller-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: controller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-controller*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+              - Effect: Allow
+                Action: lambda:RunMicroVm
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt MicroVmExecutionRole.Arn
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ControllerDeadLetterQueue.Arn
+
+  ControllerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-controller-dlq"
+      MessageRetentionPeriod: 1209600
+
+  ControllerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-controller"
+      PackageType: Image
+      Architectures: [x86_64]
+      # 5-minute SSE window plus time to SIGTERM the CLI; expected path is a clean exit, not a Lambda timeout.
+      Timeout: 360
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt ControllerDeadLetterQueue.Arn
+      Role: !GetAtt ControllerRole.Arn
+      Code:
+        ImageUri: !Ref ControllerImageUri
+      Environment:
+        Variables:
+          CURSOR_POOL: !Ref PoolName
+          POOL_NAME: !Ref PoolName
+          SPAWN_SCRIPT: /var/task/spawn.sh
+          CURSOR_AGENT_BIN: /usr/local/bin/agent
+          CONTROLLER_RUN_SECONDS: "300"
+          HOME: /tmp
+          NODE_COMPILE_CACHE: /tmp/cursor-compile-cache
+          CURSOR_API_URL: https://api.cursor.com
+          CURSOR_API_ENDPOINT: https://api.cursor.com
+          MICROVM_IMAGE_IDENTIFIER: !If
+            - ImageIsArn
+            - !Ref MicroVmImageIdentifier
+            - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
+          MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
+          CURSOR_API_KEY_PARAM_NAME: !Ref CursorApiKeyParamName
+
+  PollRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-controller"
+      Description: >-
+        Keep the worker controller available. Each invoke runs one 5-minute SSE
+        poll window; reserved concurrency 1 drops overlapping ticks.
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: Controller
+          Arn: !GetAtt ControllerFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 0
+            MaximumEventAgeInSeconds: 60
+
+  PollPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControllerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PollRule.Arn
+
 Outputs:
+  ControllerFunctionName:
+    Value: !Ref ControllerFunction
+  ControllerDeadLetterQueueUrl:
+    Value: !Ref ControllerDeadLetterQueue
   ArtifactBucketName:
     Value: !Ref ArtifactBucket
   BuildRoleArn:
@@ -111,3 +234,5 @@ Outputs:
     Value: !GetAtt MicroVmExecutionRole.Arn
   SpawnRoleArn:
     Value: !GetAtt SpawnRole.Arn
+  PoolName:
+    Value: !Ref PoolName
