@@ -3,4 +3,6 @@
 #   curl -fsSL https://cursor.com/install | bash
 #
 # This file ships in the create-microvm-image zip (AWS may not pass Docker --build-arg).
-# Put a version string on its own line, rebuild the MicroVM image, then re-zip/upload.
+# The controller image reads the same file. Put a version string on its own line,
+# then rebuild the MicroVM image and the controller image.
+2026.08.20-f582eb6
