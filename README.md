@@ -2,7 +2,7 @@
 
 This template runs Cursor self-hosted pool workers inside Lambda MicroVMs (`aws lambda-microvms run-microvm`).
 
-A scheduled Lambda keeps `agent worker controller --spawn ./spawn.sh` running, where `spawn.sh` actually creates Lambda MicroVM Sandboxes for each agent. Each invoke polls for **5 minutes** (the SSE window), then exits. EventBridge `rate(1 minute)` starts the next invoke as soon as the function is free. `ReservedConcurrentExecutions: 1` prevents two controllers from overlapping (extra ticks are throttled and dropped). If an invoke crashes, the DLQ records it and the next schedule starts a new process.
+A scheduled Lambda keeps `agent worker controller --spawn ./spawn.sh` running, where `spawn.sh` actually creates Lambda MicroVM sandboxes for each agent. Each invoke polls for **5 minutes** (the SSE window), then exits. EventBridge `rate(1 minute)` starts the next invoke as soon as the function is free. `ReservedConcurrentExecutions: 1` prevents two controllers from overlapping (extra ticks are throttled and dropped). If an invoke crashes, the DLQ records it and the next schedule starts a new process.
 
 ## Deploy
 
