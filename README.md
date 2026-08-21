@@ -11,7 +11,7 @@ A controller launches one MicroVM per pending pool request:
 1. You start a cloud agent at [cursor.com/agents](https://cursor.com/agents) against a self-hosted pool. The request stays pending until a worker claims it.
 2. The controller (`agent worker controller --spawn ./spawn.sh`) sees that request and runs [`spawn.sh`](spawn.sh).
 3. `spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) (`RunMicrovm`) and returns. `--run-hook-payload` forwards `CURSOR_*` into the guest.
-4. The MicroVM `/run` hook starts `cursor-agent worker start --pool`. The worker executes tool calls in your account.
+4. The MicroVM `/run` hook ([`hook.py`](microvm-image/hook.py)) applies that payload and starts [`entrypoint.sh`](microvm-image/entrypoint.sh), which runs `cursor-agent worker start --pool --worker-dir`. The worker executes tool calls in your account.
 5. When the session is idle, the worker releases and the MicroVM can terminate.
 
 ## Key properties
@@ -23,6 +23,44 @@ A controller launches one MicroVM per pending pool request:
 | IAM | Guest uses short-lived credentials from `MicroVmExecutionRoleArn` |
 | Duration | Each MicroVM can run up to 8 hours (`--maximum-duration-in-seconds 28800` in `spawn.sh`) |
 | Pay-per-session | You pay for that MicroVM’s runtime, not for idle pool capacity |
+
+## Pool and repo modes
+
+Product semantics: [Self-hosted pools](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md) ([repo-less / Any repo](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#repo-less-pools), [pool names](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#pool-names), [multiple repo roots](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#register-multiple-repo-roots)). `repo` and `pool` labels are reserved; the worker derives `repo=` from a git remote when one exists.
+
+**This template’s default:** the controller Lambda runs `agent worker controller --spawn ./spawn.sh --pool default` (`PoolName` / `POOL_NAME` / `CURSOR_POOL` in [`cloudformation.yaml`](cloudformation.yaml)). The guest image is built with `POOL_NAME=default`. [`hook.py`](microvm-image/hook.py) does not clone. [`entrypoint.sh`](microvm-image/entrypoint.sh) starts the worker from `/opt/cursor/workspaces/workspace` (a `git init` with **no remote** unless `CURSOR_REPO_URL` / `REPO_URL` is set). Keep stack `PoolName` and image `POOL_NAME` the same.
+
+### Any-repo mode
+
+Dashboard: **Any repo**. Docs: [repo-less pools](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#repo-less-pools). Routing is by **pool name**, not by git remote. Users must specify the pool name(s) when starting an agent: the dashboard **Any repo** group, `pool=<name>` on Slack/GitHub/Linear, or the API with `env.type: "pool"` and `env.name`, omitting `repos`. Those starts omit `repo=` labels. Do not assume every pool request includes `repo=`.
+
+Controller — dedicated any-repo fleet:
+
+```bash
+agent worker controller --spawn ./spawn.sh --pool <name>
+```
+
+Repeat `--pool` for several names. `--all-pools` is not the right default for a dedicated any-repo fleet. On the scheduled Lambda, extra controller flags (including another `--pool`) go in `CURSOR_WORKER_CONTROLLER_ARGS`.
+
+Guest:
+
+```bash
+agent worker --pool <name> --worker-dir <dir> start
+```
+
+`<dir>` must have **no git remote**, so the worker omits `repo=` labels. `--pool` on the guest must match the controller pool name. This image passes `--pool` from `POOL_NAME` (then `CURSOR_POOL`). The public CLI also reads `CURSOR_WORKER_POOL_NAME` when you run `agent worker --pool start` with no name; this entrypoint always passes `--pool` explicitly.
+
+Today, with `CURSOR_REPO_URL` unset, the entrypoint `git init`s `/opt/cursor/workspaces/workspace` with no remote and starts the worker there. That is any-repo routing (no `repo=` labels).
+
+Optional: at MicroVM start, clone the repo(s) on the pending request so the agent has files. The controller injects `CURSOR_REPO_URL`, `CURSOR_REPO_OWNER`, and `CURSOR_REPO_NAME`; [`spawn.sh`](spawn.sh) forwards them via `--run-hook-payload`. If `CURSOR_REPO_URL` is set, the entrypoint already `git clone`s it. If you then start the worker from that clone (this template does), **this session becomes repo-bound** to that repo. For a worker that stays any-repo, keep `--worker-dir` as a directory with no git remote and let the agent or your scripts clone into it.
+
+### Repo-bound mode
+
+The worker serves one or more specific git remotes. Clone the repo into the MicroVM **image/snapshot** (bake it into [`microvm-image/`](microvm-image/) so Firecracker snapshot boot has the tree) **or** clone on MicroVM start from `CURSOR_REPO_URL` (the entrypoint already does this when that variable is set). Then point the worker at that root (`cd` or `--worker-dir`). The worker derives `repo=owner/name` from the git remote. Do not set `repo=` labels by hand.
+
+Multi-root: repeat `--worker-dir` (up to 20). The first root is primary. This template’s entrypoint passes a single `--worker-dir`. To register more roots, repeat the flag on `worker start` in [`entrypoint.sh`](microvm-image/entrypoint.sh).
+
+Users pick the repo in the dashboard (the pool appears under that repo). The pool name is optional extra routing, not a substitute for the clone.
 
 ## Prerequisites
 
@@ -70,7 +108,10 @@ A controller launches one MicroVM per pending pool request:
 
 ## Run a cloud agent
 
-Open [cursor.com/agents](https://cursor.com/agents). Choose **Self-hosted** and the pool name (`default` unless you overrode `PoolName`).
+Open [cursor.com/agents](https://cursor.com/agents). Choose **Self-hosted**.
+
+- **Any-repo mode:** pick the **Any repo** group and the pool name (`default` unless you overrode `PoolName`).
+- **Repo-bound mode:** pick the repo. The pool appears under that repo.
 
 ## Alternative: run the controller locally
 
@@ -84,7 +125,7 @@ export CURSOR_API_KEY=YOUR_SERVICE_ACCOUNT_KEY
 agent worker controller --spawn ./spawn.sh --pool default
 ```
 
-`--pool` is required (or use `--all-pools`). `cursor-agent worker controller --spawn ./spawn.sh --pool default` is the same CLI. If `controller` is missing from the prod CLI, install a [lab build](https://cursor.com/install?channel=lab).
+`--pool` is required. Repeat it for several names. `--all-pools` exists but is not the right default for a dedicated any-repo fleet. `cursor-agent worker controller --spawn ./spawn.sh --pool default` is the same CLI. If `controller` is missing from the prod CLI, install a [lab build](https://cursor.com/install?channel=lab).
 
 Assume stack output `SpawnRoleArn` so `spawn.sh` can call `run-microvm`. `MICROVM_EXECUTION_ROLE_ARN` is stack output `MicroVmExecutionRoleArn`.
 
@@ -110,7 +151,7 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 ## Related resources
 
 - [AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html)
-- [Cursor self-hosted pools](https://cursor.com/docs/cloud-agent/self-hosted-pool)
+- [Cursor self-hosted pools](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md) ([Any repo / repo-less](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#repo-less-pools), [pool names](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#pool-names), [multiple repo roots](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#register-multiple-repo-roots))
 - This repo: [`spawn.sh`](spawn.sh), [`cloudformation.yaml`](cloudformation.yaml), [`microvm-image/`](microvm-image/)
 
 <!-- REMOVE BEFORE PUBLISHING: internal lab CLI pin. Not for partners. -->
