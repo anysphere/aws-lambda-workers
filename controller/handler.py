@@ -15,16 +15,71 @@ DEFAULT_RUN_SECONDS = 300
 SHUTDOWN_GRACE_SECONDS = 15
 
 
+def split_names(value: str | None) -> list[str]:
+    parts: list[str] = []
+    for chunk in (value or "").replace(";", ",").split(","):
+        name = chunk.strip()
+        if name:
+            parts.append(name)
+    return parts
+
+
+def truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def extra_has_flag(extra: list[str], *names: str) -> bool:
+    flags = set(names)
+    prefixes = tuple(f"{name}=" for name in names)
+    return any(part in flags or part.startswith(prefixes) for part in extra)
+
+
 def controller_args(env: dict[str, str]) -> list[str]:
     script = env.get("SPAWN_SCRIPT") or os.path.join(os.getcwd(), "spawn.sh")
     extra = [part for part in env.get("CURSOR_WORKER_CONTROLLER_ARGS", "").split() if part]
     args = ["worker", "controller", "--spawn", script]
-    has_pool = any(
-        part == "--pool" or part == "--all-pools" or part.startswith("--pool=") for part in extra
+
+    all_pools = extra_has_flag(extra, "--all-pools") or truthy(
+        env.get("CONTROLLER_ALL_POOLS") or env.get("ALL_POOLS")
     )
-    if not has_pool:
-        pool = env.get("POOL_NAME") or env.get("CURSOR_POOL") or "default"
-        args.extend(["--pool", pool])
+    pools = split_names(
+        env.get("CONTROLLER_POOL_NAMES")
+        or env.get("POOL_NAMES")
+        or env.get("POOL_NAME")
+        or env.get("CURSOR_POOL")
+    )
+    repos = split_names(
+        env.get("CONTROLLER_REPOSITORY_URLS")
+        or env.get("REPOSITORY_URLS")
+        or env.get("CURSOR_REPO_URL")
+    )
+
+    if extra_has_flag(extra, "--pool", "--all-pools"):
+        pass
+    elif all_pools:
+        args.append("--all-pools")
+    elif pools:
+        for pool in pools:
+            args.extend(["--pool", pool])
+    elif repos:
+        # CLI requires --pool or --all-pools; repo filters apply on top.
+        args.append("--all-pools")
+
+    if not extra_has_flag(extra, "--repository"):
+        for repo in repos:
+            args.extend(["--repository", repo])
+
+    if (
+        not extra_has_flag(extra, "--pool", "--all-pools", "--repository")
+        and not all_pools
+        and not pools
+        and not repos
+    ):
+        raise RuntimeError(
+            "configure CONTROLLER_POOL_NAMES, CONTROLLER_ALL_POOLS=true, "
+            "and/or CONTROLLER_REPOSITORY_URLS"
+        )
+
     args.extend(extra)
     return args
 

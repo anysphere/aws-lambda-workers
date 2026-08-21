@@ -15,8 +15,16 @@ if [[ "${IMAGE}" != arn:* ]]; then
   IMAGE="arn:aws:lambda:${REGION}:${ACCOUNT}:microvm-image:${IMAGE}"
 fi
 
-PAYLOAD="$(python3 -c 'import json,os; print(json.dumps({k:v for k,v in os.environ.items() if k.startswith("CURSOR_")}))')"
+# Claim metadata plus the API key. Do not forward CURSOR_API_ENDPOINT /
+# CURSOR_API_URL from the controller Lambda — those point at api.cursor.com,
+# which is the public REST host, not the worker auth exchange.
+PAYLOAD="$(python3 -c 'import json,os
+skip={"CURSOR_API_ENDPOINT","CURSOR_API_URL","CURSOR_API_KEY_PARAM_NAME"}
+print(json.dumps({k:v for k,v in os.environ.items() if k.startswith("CURSOR_") and k not in skip}))')"
 
+# Outbound-only workers never hit the HTTPS ingress, so a short default idle
+# policy would suspend the VM before the agent connects. Guest logs go to
+# /aws/lambda/microvms/cursor-pool-worker (execution role already allows it).
 exec aws lambda-microvms run-microvm \
   --region "${REGION}" \
   --image-identifier "${IMAGE}" \
@@ -24,4 +32,6 @@ exec aws lambda-microvms run-microvm \
   --ingress-network-connectors "arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:ALL_INGRESS" \
   --egress-network-connectors "arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS" \
   --maximum-duration-in-seconds 28800 \
+  --idle-policy '{"autoResumeEnabled":false,"maxIdleDurationSeconds":28800,"suspendedDurationSeconds":28800}' \
+  --logging '{"cloudWatch":{"logGroup":"/aws/lambda/microvms/cursor-pool-worker"}}' \
   --run-hook-payload "${PAYLOAD}"

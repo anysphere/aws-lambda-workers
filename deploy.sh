@@ -14,9 +14,21 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text "${REGION_A
 REPO="${CONTROLLER_ECR_REPO:-cursor-lambda-workers-controller}"
 TAG="${CONTROLLER_IMAGE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo local)-$(date +%Y%m%d%H%M%S)}"
 URI="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${TAG}"
-POOL_NAME="${POOL_NAME:-default}"
+POOL_NAMES="${POOL_NAMES:-${POOL_NAME:-}}"
+ALL_POOLS="${ALL_POOLS:-false}"
+case "${ALL_POOLS}" in
+  1|true|TRUE|yes|YES|on|ON) ALL_POOLS=true ;;
+  *) ALL_POOLS=false ;;
+esac
+REPOSITORY_URLS="${REPOSITORY_URLS:-}"
 CURSOR_API_KEY_PARAM_NAME="${CURSOR_API_KEY_PARAM_NAME:-/cursor-lambda-workers/cursor-api-key}"
 MICROVM_IMAGE_IDENTIFIER="${MICROVM_IMAGE_IDENTIFIER:-cursor-pool-worker}"
+
+if [[ -z "${POOL_NAMES}" && "${ALL_POOLS}" != "true" && -z "${REPOSITORY_URLS}" ]]; then
+  echo "Set POOL_NAMES (comma-separated), ALL_POOLS=true, and/or REPOSITORY_URLS so the controller knows what to serve." >&2
+  echo "Example: POOL_NAMES=default ./deploy.sh" >&2
+  exit 1
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required to build the controller Lambda image." >&2
@@ -70,7 +82,9 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     "ControllerImageUri=${URI}" \
-    "PoolName=${POOL_NAME}" \
+    "PoolNames=${POOL_NAMES}" \
+    "AllPools=${ALL_POOLS}" \
+    "RepositoryUrls=${REPOSITORY_URLS}" \
     "CursorApiKeyParamName=${CURSOR_API_KEY_PARAM_NAME}" \
     "MicroVmImageIdentifier=${MICROVM_IMAGE_IDENTIFIER}" \
   "${REGION_ARG[@]}"
@@ -84,4 +98,9 @@ aws lambda invoke \
   "${REGION_ARG[@]}" >/dev/null
 
 echo "Stack ${STACK_NAME} deployed. Controller ${FUNC} is running (5-minute SSE window; EventBridge rate(1 minute) restarts it)."
-echo "Build the MicroVM image next, then start an agent from cursor.com/agents against pool ${POOL_NAME}."
+if [[ "${ALL_POOLS}" == "true" ]]; then
+  echo "Serving all pools${REPOSITORY_URLS:+, repositories ${REPOSITORY_URLS}}."
+else
+  echo "Serving pools ${POOL_NAMES:-none}${REPOSITORY_URLS:+, repositories ${REPOSITORY_URLS}}."
+fi
+echo "Build the MicroVM image next (POOL_NAME should match a pool this controller serves), then start an agent from cursor.com/agents."

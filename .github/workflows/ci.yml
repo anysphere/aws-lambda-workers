@@ -29,7 +29,9 @@ jobs:
           grep -q "AWS::Events::Rule" cloudformation.yaml
           grep -q "ReservedConcurrentExecutions: 1" cloudformation.yaml
           grep -q "rate(1 minute)" cloudformation.yaml
-          grep -q "CONTROLLER_RUN_SECONDS: \"300\"" cloudformation.yaml
+          grep -q "CONTROLLER_POOL_NAMES" cloudformation.yaml
+          grep -q "CONTROLLER_REPOSITORY_URLS" cloudformation.yaml
+          grep -q "CONTROLLER_ALL_POOLS" cloudformation.yaml
           grep -q "agent worker controller --spawn" controller/handler.py
           grep -q "aws lambda-microvms run-microvm" spawn.sh
           grep -q -- "--run-hook-payload" spawn.sh

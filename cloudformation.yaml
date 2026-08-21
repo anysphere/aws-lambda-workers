@@ -14,10 +14,23 @@ Parameters:
   ControllerImageUri:
     Type: String
     Description: ECR image URI for the controller Lambda (controller/Dockerfile). Build with ./deploy.sh.
-  PoolName:
+  PoolNames:
     Type: String
-    Default: default
-    Description: Pool label workers register as (`agent worker controller --pool` / `worker start --pool`).
+    Default: ""
+    Description: >-
+      Comma-separated pool names for `agent worker controller --pool` (repeatable).
+      Mutually exclusive with AllPools=true. Set PoolNames, AllPools, and/or RepositoryUrls.
+  AllPools:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: If true, pass `--all-pools` (team-wide). Mutually exclusive with PoolNames.
+  RepositoryUrls:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma-separated repository URLs for `agent worker controller --repository`.
+      Required for repo-scoped API keys. Can combine with PoolNames or AllPools.
   MicroVmImageIdentifier:
     Type: String
     Default: cursor-pool-worker
@@ -139,7 +152,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-controller*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-controller*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/*"
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
@@ -181,8 +196,9 @@ Resources:
         ImageUri: !Ref ControllerImageUri
       Environment:
         Variables:
-          CURSOR_POOL: !Ref PoolName
-          POOL_NAME: !Ref PoolName
+          CONTROLLER_POOL_NAMES: !Ref PoolNames
+          CONTROLLER_ALL_POOLS: !Ref AllPools
+          CONTROLLER_REPOSITORY_URLS: !Ref RepositoryUrls
           SPAWN_SCRIPT: /var/task/spawn.sh
           CURSOR_AGENT_BIN: /usr/local/bin/agent
           CONTROLLER_RUN_SECONDS: "300"
@@ -234,5 +250,9 @@ Outputs:
     Value: !GetAtt MicroVmExecutionRole.Arn
   SpawnRoleArn:
     Value: !GetAtt SpawnRole.Arn
-  PoolName:
-    Value: !Ref PoolName
+  PoolNames:
+    Value: !Ref PoolNames
+  AllPools:
+    Value: !Ref AllPools
+  RepositoryUrls:
+    Value: !Ref RepositoryUrls
