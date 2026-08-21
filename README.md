@@ -2,7 +2,7 @@
 
 This template runs Cursor self-hosted pool workers inside Lambda MicroVMs (`aws lambda-microvms run-microvm`).
 
-A scheduled Lambda keeps `agent worker controller --spawn ./spawn.sh` running. Each invoke polls for **5 minutes** (the SSE window), then exits. EventBridge `rate(1 minute)` starts the next invoke as soon as the function is free. `ReservedConcurrentExecutions: 1` prevents two controllers from overlapping (extra ticks are throttled and dropped). If an invoke crashes, the DLQ records it and the next schedule starts a new process.
+A scheduled Lambda keeps `agent worker controller --spawn ./spawn.sh` running, where `spawn.sh` actually creates Lambda MicroVM Sandboxes for each agent. Each invoke polls for **5 minutes** (the SSE window), then exits. EventBridge `rate(1 minute)` starts the next invoke as soon as the function is free. `ReservedConcurrentExecutions: 1` prevents two controllers from overlapping (extra ticks are throttled and dropped). If an invoke crashes, the DLQ records it and the next schedule starts a new process.
 
 ## Deploy
 
@@ -45,11 +45,8 @@ Then start an agent from [cursor.com/agents](https://cursor.com/agents) against 
 
 ## How it works
 
-EventBridge `rate(1 minute)` invokes the controller Lambda. The handler runs `agent worker controller --spawn ./spawn.sh --pool default` for 300 seconds, SIGTERMs the CLI, and returns success so the expected restart is not a Lambda timeout. Timeout on the function is 360 seconds (window plus shutdown). Overlapping ticks hit reserved concurrency 1 and are dropped; the next free minute starts a new poll loop.
-
 `spawn.sh` calls [`aws lambda-microvms run-microvm`](https://docs.aws.amazon.com/cli/latest/reference/lambda-microvms/run-microvm.html) and returns. `--run-hook-payload` forwards `CURSOR_*` into the guest. The image ENTRYPOINT runs `cursor-agent worker start --pool`.
 
-A true always-on daemon would be a Lambda MicroVM (8h) or ECS with restart running the same CLI. This stack uses a 15-minute-max function on a 5-minute SSE cadence instead.
 
 ## Alternative: run the controller locally
 
