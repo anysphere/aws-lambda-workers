@@ -68,14 +68,6 @@ A controller launches one MicroVM per pending pool request:
 
 4. Start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
 
-## Pin a CLI version
-
-Optional. To test a CLI off `main`, put a lab version (`YYYY.MM.DD-<sha7>`) in [`microvm-image/cursor-agent-version`](microvm-image/cursor-agent-version) and rebuild the MicroVM image **and** the controller image.
-
-Lab builds: [cursor.com/install?channel=lab](https://cursor.com/install?channel=lab), the `agent-cli.yml` GitHub Action on `main`, or `https://downloads.cursor.com/lab/<version>/linux/x64/agent-cli-package.tar.gz`.
-
-Leave the file empty (comments only) to use the prod installer at [cursor.com/install](https://cursor.com/install).
-
 ## Run a cloud agent
 
 Open [cursor.com/agents](https://cursor.com/agents). Choose **Self-hosted** and the pool name (`default` unless you overrode `PoolName`).
@@ -120,3 +112,15 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 - [AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html)
 - [Cursor self-hosted pools](https://cursor.com/docs/cloud-agent/self-hosted-pool)
 - This repo: [`spawn.sh`](spawn.sh), [`cloudformation.yaml`](cloudformation.yaml), [`microvm-image/`](microvm-image/)
+
+<!-- REMOVE BEFORE PUBLISHING: internal lab CLI pin. Not for partners. -->
+
+## REMOVE BEFORE PUBLISHING: Pin a CLI version
+
+> Internal only — not for partners. Delete this section before sharing the README.
+
+Optional. To test a CLI off `main`, put a lab version (`YYYY.MM.DD-<sha7>`) in [`microvm-image/cursor-agent-version`](microvm-image/cursor-agent-version) and rebuild the MicroVM image **and** the controller image.
+
+Lab builds: [cursor.com/install?channel=lab](https://cursor.com/install?channel=lab), the `agent-cli.yml` GitHub Action on `main`, or `https://downloads.cursor.com/lab/<version>/linux/x64/agent-cli-package.tar.gz`.
+
+Leave the file empty (comments only) to use the prod installer at [cursor.com/install](https://cursor.com/install).
