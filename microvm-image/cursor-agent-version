@@ -3,6 +3,6 @@
 #   curl -fsSL https://cursor.com/install | bash
 #
 # This file ships in the create-microvm-image zip (AWS may not pass Docker --build-arg).
-# Put the version on its own line, rebuild the MicroVM image, then re-zip/upload.
-# Prod (2026.08.11) has no `worker controller`; the scheduled Lambda needs this lab CLI.
+# Put the version on its own line, rebuild the MicroVM image and the controller image.
+# Prod CLI may omit `worker controller`; pin a lab version if `controller` is missing.
 2026.08.20-f582eb6
