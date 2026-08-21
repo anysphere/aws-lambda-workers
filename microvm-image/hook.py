@@ -18,6 +18,10 @@ class Hook(BaseHTTPRequestHandler):
             env = json.loads(payload) if isinstance(payload, str) else payload
             if isinstance(env, dict):
                 os.environ.update({str(k): str(v) for k, v in env.items() if v is not None})
+            os.environ.setdefault("HOME", "/root")
+            os.environ.setdefault("NODE_COMPILE_CACHE", "/tmp/cursor-compile-cache")
+            keys = sorted(k for k in os.environ if k.startswith("CURSOR_"))
+            print(f"hook /run microvmId={body.get('microvmId')} cursor_keys={keys}", flush=True)
             subprocess.Popen(
                 ["/opt/cursor/entrypoint.sh"],
                 env=os.environ.copy(),

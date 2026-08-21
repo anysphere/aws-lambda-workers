@@ -2,6 +2,8 @@
 # Clone if needed, then exec cursor-agent worker start --pool.
 set -euo pipefail
 export GIT_TERMINAL_PROMPT=0
+export HOME="${HOME:-/root}"
+export NODE_COMPILE_CACHE="${NODE_COMPILE_CACHE:-/tmp/cursor-compile-cache}"
 export PATH="/root/.cursor/bin:/root/.local/bin:/usr/local/bin:${PATH}"
 
 if [[ -z "${CURSOR_API_KEY:-}" && -n "${CURSOR_API_KEY_PARAM_NAME:-}" ]]; then
@@ -12,6 +14,11 @@ if [[ -z "${CURSOR_API_KEY:-}" ]]; then
   echo "FATAL: set CURSOR_API_KEY or CURSOR_API_KEY_PARAM_NAME" >&2
   exit 1
 fi
+# Controller Lambda sets these to https://api.cursor.com (public REST).
+# `worker start` uses --endpoint for /auth/exchange_user_api_key, which lives
+# on the default CLI host (api2.cursor.sh). Forwarding api.cursor.com makes
+# every service-account key look invalid.
+unset CURSOR_API_ENDPOINT CURSOR_API_URL
 
 POOL_NAME="${POOL_NAME:-${CURSOR_POOL:-default}}"
 IDLE_RELEASE_TIMEOUT_SECONDS="${IDLE_RELEASE_TIMEOUT_SECONDS:-300}"
@@ -37,9 +44,16 @@ fi
 
 cd "${dest}"
 AGENT_BIN="$(command -v cursor-agent || command -v agent)"
+echo "entrypoint: pool=${POOL_NAME} dest=${dest} worker_id=${CURSOR_AGENT_WORKER_ID:-} agent=${AGENT_BIN} uname=$(uname -m)" >&2
 NAME_ARGS=()
 if [[ -n "${CURSOR_WORKER_NAME:-}" ]]; then
   NAME_ARGS=(--name "${CURSOR_WORKER_NAME}")
 fi
-exec "${AGENT_BIN}" worker start --pool "${POOL_NAME}" --worker-dir "${dest}" \
-  --idle-release-timeout "${IDLE_RELEASE_TIMEOUT_SECONDS}" "${NAME_ARGS[@]}"
+WORKER_ID_ARGS=()
+if [[ -n "${CURSOR_AGENT_WORKER_ID:-}" ]]; then
+  WORKER_ID_ARGS=(--worker-id "${CURSOR_AGENT_WORKER_ID}")
+fi
+# Flags belong on `worker` (parent). `start` only accepts --verbose.
+exec "${AGENT_BIN}" worker --pool "${POOL_NAME}" --worker-dir "${dest}" \
+  --idle-release-timeout "${IDLE_RELEASE_TIMEOUT_SECONDS}" \
+  "${WORKER_ID_ARGS[@]}" "${NAME_ARGS[@]}" start --verbose
