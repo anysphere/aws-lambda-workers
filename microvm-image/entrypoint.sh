@@ -24,6 +24,11 @@ POOL_NAME="${POOL_NAME:-${CURSOR_POOL:-default}}"
 IDLE_RELEASE_TIMEOUT_SECONDS="${IDLE_RELEASE_TIMEOUT_SECONDS:-300}"
 WORKSPACES="${WORKSPACES:-/opt/cursor/workspaces}"
 REPO_URL="${REPO_URL:-${CURSOR_REPO_URL:-}}"
+# Pending-requests emits sanitized host/path (no scheme). git treats that as a
+# local path and fails: repository 'github.com/org/repo' does not exist.
+if [[ -n "${REPO_URL}" && "${REPO_URL}" != *://* && "${REPO_URL}" != git@* ]]; then
+  REPO_URL="https://${REPO_URL}"
+fi
 mkdir -p "${WORKSPACES}"
 dest="${WORKSPACES}/workspace"
 
