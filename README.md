@@ -54,13 +54,17 @@ Today, with `CURSOR_REPO_URL` unset, the entrypoint `git init`s `/opt/cursor/wor
 
 Optional: at MicroVM start, clone the repo(s) on the pending request so the agent has files. The controller injects `CURSOR_REPO_URL`, `CURSOR_REPO_OWNER`, and `CURSOR_REPO_NAME`; [`spawn.sh`](spawn.sh) forwards them via `--run-hook-payload`. If `CURSOR_REPO_URL` is set, the entrypoint already `git clone`s it. If you then start the worker from that clone (this template does), **this session becomes repo-bound** to that repo. For a worker that stays any-repo, keep `--worker-dir` as a directory with no git remote and let the agent or your scripts clone into it.
 
+Sample: `CURSOR_REPO_URL=https://github.com/octocat/Hello-World` (`octocat/Hello-World`). This is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work. Private repos need git auth (HTTPS token or SSH) on the worker.
+
 ### Repo-bound mode
 
-The worker serves one or more specific git remotes. Clone the repo into the MicroVM **image/snapshot** (bake it into [`microvm-image/`](microvm-image/) so Firecracker snapshot boot has the tree) **or** clone on MicroVM start from `CURSOR_REPO_URL` (the entrypoint already does this when that variable is set). Then point the worker at that root (`cd` or `--worker-dir`). The worker derives `repo=owner/name` from the git remote. Do not set `repo=` labels by hand.
+The worker serves one or more specific git remotes. Clone the repo into the MicroVM **image/snapshot** (bake it into [`microvm-image/`](microvm-image/) so Firecracker snapshot boot has the tree) **or** clone on MicroVM start from `CURSOR_REPO_URL` (the entrypoint already does this when that variable is set). Then point the worker at that root (`cd` or `--worker-dir`). The worker derives `repo=octocat/Hello-World` from the git remote. Do not set `repo=` labels by hand.
+
+Sample: `CURSOR_REPO_URL=https://github.com/octocat/Hello-World` (`octocat/Hello-World`). This is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work. Private repos need git auth (HTTPS token or SSH) on the worker.
 
 Multi-root: repeat `--worker-dir` (up to 20). The first root is primary. This template’s entrypoint passes a single `--worker-dir`. To register more roots, repeat the flag on `worker start` in [`entrypoint.sh`](microvm-image/entrypoint.sh).
 
-Users pick the repo in the dashboard (the pool appears under that repo). The pool name is optional extra routing, not a substitute for the clone.
+Users pick `octocat/Hello-World` in the dashboard (the pool appears under that repo). Replace that public sample with your real repository before you run real work. The pool name is optional extra routing, not a substitute for the clone.
 
 ## Prerequisites
 
@@ -84,9 +88,11 @@ Users pick the repo in the dashboard (the pool appears under that repo). The poo
    ```bash
    POOL_NAMES=default ./deploy.sh
    # POOL_NAMES=gpu,default ./deploy.sh
-   # REPOSITORY_URLS=https://github.com/org/repo ./deploy.sh
+   # REPOSITORY_URLS=https://github.com/octocat/Hello-World ./deploy.sh
    # ALL_POOLS=true ./deploy.sh
    ```
+
+   `https://github.com/octocat/Hello-World` (`octocat/Hello-World`) is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work. Private repos need git auth (HTTPS token or SSH) on the worker.
 
 3. Build the worker image from [`microvm-image/`](microvm-image/) (needs the stack outputs):
 
@@ -107,14 +113,14 @@ Users pick the repo in the dashboard (the pool appears under that repo). The poo
      --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60}}'
    ```
 
-4. Start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool.
+4. Start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool, or against `octocat/Hello-World` for the repo-bound walkthrough. That GitHub repo is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work.
 
 ## Run a cloud agent
 
 Open [cursor.com/agents](https://cursor.com/agents). Choose **Self-hosted**.
 
 - **Any-repo mode:** pick the **Any repo** group and the pool name (`default` unless you overrode `PoolNames`).
-- **Repo-bound mode:** pick the repo. The pool appears under that repo.
+- **Repo-bound mode:** pick `octocat/Hello-World` (`https://github.com/octocat/Hello-World`). This is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work. Private repos need git auth (HTTPS token or SSH) on the worker. The pool appears under that repo.
 
 ## Alternative: run the controller locally
 
