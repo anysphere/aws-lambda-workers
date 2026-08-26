@@ -14,6 +14,8 @@ A controller launches one MicroVM per pending pool request:
 4. The MicroVM `/run` hook ([`hook.py`](microvm-image/hook.py)) applies that payload and starts [`entrypoint.sh`](microvm-image/entrypoint.sh), which runs `cursor-agent worker --pool --worker-dir start`. The worker executes tool calls in your account.
 5. When the session is idle, the worker releases and the MicroVM can terminate.
 
+Image create also POSTs `/ready` (before the snapshot: hook listener up and `/run` bits on disk) and `/validate` (after a test run from the snapshot: cheap agent `--version`/`--help`, no `worker start`). Partners must **rebuild the MicroVM image** after this change so `/ready` and `/validate` are in the snapshot path.
+
 ## Key properties
 
 | Property | Benefit |
@@ -94,7 +96,7 @@ Users pick `octocat/Hello-World` in the dashboard (the pool appears under that r
 
    `https://github.com/octocat/Hello-World` (`octocat/Hello-World`) is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work. Private repos need git auth (HTTPS token or SSH) on the worker.
 
-3. Build the worker image from [`microvm-image/`](microvm-image/) (needs the stack outputs):
+3. Build the worker image from [`microvm-image/`](microvm-image/) (needs the stack outputs). Enable both `ready` and `validate` image hooks. After this template change, **rebuild the MicroVM image** so those hooks are in the snapshot path:
 
    ```bash
    BUCKET=$(aws cloudformation describe-stacks --stack-name cursor-lambda-workers \
@@ -110,7 +112,7 @@ Users pick `octocat/Hello-World` in the dashboard (the pool appears under that r
      --base-image-arn "${BASE}" \
      --build-role-arn "${BUILD_ROLE}" \
      --environment-variables "POOL_NAME=default,CURSOR_API_KEY_PARAM_NAME=/cursor-lambda-workers/cursor-api-key" \
-     --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60}}'
+     --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60,"validate":"ENABLED","validateTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60}}'
    ```
 
 4. Start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool, or against `octocat/Hello-World` for the repo-bound walkthrough. That GitHub repo is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work.
@@ -153,6 +155,7 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 | Symptom | What to check |
 | --- | --- |
 | Image build fails (S3 or IAM) | Confirm stack outputs `ArtifactBucketName` and `BuildRoleArn`. The zip must land in that bucket, and the build role must be able to read it. |
+| Image built before `/ready`+`/validate` | Rebuild the MicroVM image so those hooks are in the snapshot path. Existing snapshots were taken without them. |
 | No MicroVM | Confirm the controller is running and can call `run-microvm`. For a local controller, assume `SpawnRoleArn`. Confirm image `cursor-pool-worker` exists. |
 | Worker dies immediately | The guest needs `CURSOR_API_KEY` (SSM `/cursor-lambda-workers/cursor-api-key`). Confirm the `/run` hook started `cursor-agent worker --pool … start`. If logs show `Exec format error` on `node`, the image installed the wrong CLI arch (MicroVMs here are aarch64). If auth says the API key is invalid, do not set `CURSOR_API_ENDPOINT` to `https://api.cursor.com`. |
 | CLI too old for `controller` | Pin a lab version in `microvm-image/cursor-agent-version` and rebuild the MicroVM image and the controller image. |

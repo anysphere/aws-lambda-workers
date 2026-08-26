@@ -103,4 +103,4 @@ if [[ "${ALL_POOLS}" == "true" ]]; then
 else
   echo "Serving pools ${POOL_NAMES:-none}${REPOSITORY_URLS:+, repositories ${REPOSITORY_URLS}}."
 fi
-echo "Build the MicroVM image next (POOL_NAME should match a pool this controller serves), then start an agent from cursor.com/agents."
+echo "Build the MicroVM image next (enable ready+validate hooks; POOL_NAME should match a pool this controller serves), then start an agent from cursor.com/agents."

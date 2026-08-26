@@ -35,3 +35,7 @@ jobs:
           grep -q "agent worker controller --spawn" controller/handler.py
           grep -q "aws lambda-microvms run-microvm" spawn.sh
           grep -q -- "--run-hook-payload" spawn.sh
+          grep -q 'endswith("/ready")' microvm-image/hook.py
+          grep -q 'endswith("/validate")' microvm-image/hook.py
+          grep -q 'endswith("/run")' microvm-image/hook.py
+          grep -q '"validate":"ENABLED"' README.md
