@@ -136,7 +136,7 @@ export CURSOR_API_KEY=YOUR_SERVICE_ACCOUNT_KEY
 agent worker controller --spawn ./spawn.sh --pool default
 ```
 
-`--pool` is required. Repeat it for several names. `--all-pools` exists but is not the right default for a dedicated any-repo fleet. `cursor-agent worker controller --spawn ./spawn.sh --pool default` is the same CLI. If `controller` is missing from the prod CLI, install a [lab build](https://cursor.com/install?channel=lab).
+`--pool` is required. Repeat it for several names. `--all-pools` exists but is not the right default for a dedicated any-repo fleet. `cursor-agent worker controller --spawn ./spawn.sh --pool default` is the same CLI. Install the CLI from [cursor.com/install](https://cursor.com/install).
 
 Assume stack output `SpawnRoleArn` so `spawn.sh` can call `run-microvm`. `MICROVM_EXECUTION_ROLE_ARN` is stack output `MicroVmExecutionRoleArn`.
 
@@ -158,7 +158,7 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 | Image built before `/ready`+`/validate` | Rebuild the MicroVM image so those hooks are in the snapshot path. Existing snapshots were taken without them. |
 | No MicroVM | Confirm the controller is running and can call `run-microvm`. For a local controller, assume `SpawnRoleArn`. Confirm image `cursor-pool-worker` exists. |
 | Worker dies immediately | The guest needs `CURSOR_API_KEY` (SSM `/cursor-lambda-workers/cursor-api-key`). Confirm the `/run` hook started `cursor-agent worker --pool … start`. If logs show `Exec format error` on `node`, the image installed the wrong CLI arch (MicroVMs here are aarch64). If auth says the API key is invalid, do not set `CURSOR_API_ENDPOINT` to `https://api.cursor.com`. |
-| CLI too old for `controller` | Pin a lab version in `microvm-image/cursor-agent-version` and rebuild the MicroVM image and the controller image. |
+| CLI too old for `controller` | Install the current CLI from [cursor.com/install](https://cursor.com/install) and rebuild the MicroVM image and the controller image. |
 
 ## Related resources
 
@@ -166,14 +166,16 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 - [Cursor self-hosted pools](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md) ([Any repo / repo-less](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#repo-less-pools), [pool names](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#pool-names), [multiple repo roots](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#register-multiple-repo-roots))
 - This repo: [`spawn.sh`](spawn.sh), [`cloudformation.yaml`](cloudformation.yaml), [`microvm-image/`](microvm-image/)
 
-<!-- REMOVE BEFORE PUBLISHING: internal lab CLI pin. Not for partners. -->
+## License
 
-## REMOVE BEFORE PUBLISHING: Pin a CLI version
+First-party code in this repository is licensed under the **Apache License, Version 2.0** — see [`LICENSE`](LICENSE).
 
-> Internal only — not for partners. Delete this section before sharing the README.
+## Trademarks
 
-Optional. To test a CLI off `main`, put a lab version (`YYYY.MM.DD-<sha7>`) in [`microvm-image/cursor-agent-version`](microvm-image/cursor-agent-version) and rebuild the MicroVM image **and** the controller image.
+This license does not grant permission to use the trade names, trademarks, service marks, or product names of SpaceXAI, Cursor, or Grok, except as required for reasonable and customary use in describing the origin of the Work.
 
-Lab builds: [cursor.com/install?channel=lab](https://cursor.com/install?channel=lab), the `agent-cli.yml` GitHub Action on `main`, or `https://downloads.cursor.com/lab/<version>/linux/arm64/agent-cli-package.tar.gz` (x64 for amd64 guests).
+AWS and Amazon Web Services are trademarks of Amazon.com, Inc. or its affiliates. All other trademarks are the property of their respective owners.
 
-Leave the file empty (comments only) to use the prod installer at [cursor.com/install](https://cursor.com/install).
+## Disclaimer
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.

@@ -15,8 +15,8 @@ if [[ -z "${CURSOR_API_KEY:-}" ]]; then
   exit 1
 fi
 # Controller Lambda sets these to https://api.cursor.com (public REST).
-# `worker start` uses --endpoint for /auth/exchange_user_api_key, which lives
-# on the default CLI host (api2.cursor.sh). Forwarding api.cursor.com makes
+# `worker start` uses --endpoint for /auth/exchange_user_api_key on the CLI's
+# default host, not the public REST API. Forwarding api.cursor.com makes
 # every service-account key look invalid.
 unset CURSOR_API_ENDPOINT CURSOR_API_URL
 

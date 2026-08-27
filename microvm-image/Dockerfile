@@ -6,9 +6,8 @@ RUN dnf install -y --setopt=install_weak_deps=0 \
       $(command -v curl >/dev/null 2>&1 || echo curl) && \
     dnf clean all
 
-# Optional: pin a lab/main CLI, e.g. 2026.08.20-f582eb6. Empty = prod installer.
-# create-microvm-image zips this directory and may not pass --build-arg;
-# set the version in cursor-agent-version instead (ships in the zip).
+# Empty cursor-agent-version / CURSOR_AGENT_VERSION = public installer.
+# create-microvm-image zips this directory and may not pass --build-arg.
 COPY cursor-agent-version /tmp/cursor-agent-version
 ARG CURSOR_AGENT_VERSION=
 # Guest MicroVMs here are aarch64. The previous x64 default installed a node
