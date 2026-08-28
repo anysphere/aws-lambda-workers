@@ -1,0 +1,76 @@
+# Example: layer the Cursor worker runtime on an application image you already
+# publish to ECR from CI/CD. This is not the default; the stock Dockerfile
+# remains the quickstart.
+#
+# create-microvm-image does not take an ECR URI as the MicroVM image.
+# --code-artifact is a zip with a Dockerfile (this file, named Dockerfile in
+# the zip) plus Cursor files. --base-image-arn is a Lambda-managed MicroVM OS
+# from `list-managed-microvm-images`. Your ECR image is only the container
+# FROM below. See README "Bring your own ECR image".
+#
+# Edit FROM to your image tag or digest. create-microvm-image may not pass
+# --build-arg; do not rely on ARG for the image URI.
+#
+# Keep this file in sync with Dockerfile for CLI install, COPY, and ENTRYPOINT.
+
+FROM 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-ci-image:tag
+
+# Guest MicroVMs in this template are aarch64. The FROM image must be linux/arm64.
+# AWS also requires Linux, snapshot-compatible, and reachable from Lambda build
+# (public internet or ECR in the same account).
+#
+# Required on the guest (skip any your CI image already has). Package manager
+# depends on FROM (dnf / yum / apt-get / apk). Amazon Linux 2023 example:
+# RUN dnf install -y --setopt=install_weak_deps=0 \
+#       bash tar gzip git ca-certificates findutils awscli python3 \
+#       $(command -v curl >/dev/null 2>&1 || echo curl) && \
+#     dnf clean all
+#
+# If the CI image sets USER to non-root, switch back so CLI install and
+# /opt/cursor land where hook.py and entrypoint.sh expect:
+# USER root
+
+RUN missing=""; \
+    command -v python3 >/dev/null || missing="${missing} python3"; \
+    command -v git >/dev/null || missing="${missing} git"; \
+    command -v curl >/dev/null || missing="${missing} curl"; \
+    command -v tar >/dev/null || missing="${missing} tar"; \
+    command -v aws >/dev/null || missing="${missing} awscli"; \
+    if [ -n "${missing}" ]; then \
+      echo "FROM image is missing:${missing}" >&2; \
+      echo "Install them with this image's package manager, or uncomment the Amazon Linux dnf block above." >&2; \
+      exit 1; \
+    fi
+
+# CLI install matches Dockerfile. Empty cursor-agent-version = prod installer.
+# create-microvm-image zips this directory and may not pass --build-arg.
+COPY cursor-agent-version /tmp/cursor-agent-version
+ARG CURSOR_AGENT_VERSION=
+# Guest MicroVMs here are aarch64. The previous x64 default installed a node
+# binary that failed at runtime with "cannot execute binary file".
+ARG CURSOR_AGENT_ARCH=arm64
+RUN VERSION="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' /tmp/cursor-agent-version | sed -e '/^$/d' | head -n 1)" && \
+    VERSION="${VERSION:-${CURSOR_AGENT_VERSION:-}}" && \
+    ARCH="${CURSOR_AGENT_ARCH:-arm64}" && \
+    echo "installing cursor-agent ${VERSION:-prod} linux/${ARCH} (build uname=$(uname -m))" && \
+    if [ -n "${VERSION}" ]; then \
+      mkdir -p "/root/.local/share/cursor-agent/versions/${VERSION}" /root/.local/bin && \
+      curl -fsSL "https://downloads.cursor.com/lab/${VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
+        | tar --strip-components=1 -xzf - -C "/root/.local/share/cursor-agent/versions/${VERSION}" && \
+      ln -sf "/root/.local/share/cursor-agent/versions/${VERSION}/cursor-agent" /root/.local/bin/agent && \
+      ln -sf "/root/.local/share/cursor-agent/versions/${VERSION}/cursor-agent" /root/.local/bin/cursor-agent; \
+    else \
+      curl -fsSL https://cursor.com/install | bash; \
+    fi && \
+    ln -sf /root/.local/bin/agent /usr/local/bin/agent && \
+    ln -sf /root/.local/bin/agent /usr/local/bin/cursor-agent && \
+    rm -f /tmp/cursor-agent-version
+
+ENV PATH="/root/.cursor/bin:/root/.local/bin:/usr/local/bin:${PATH}"
+ENV HOME=/root
+ENV NODE_COMPILE_CACHE=/tmp/cursor-compile-cache
+WORKDIR /opt/cursor
+COPY entrypoint.sh hook.py /opt/cursor/
+RUN chmod +x /opt/cursor/entrypoint.sh /opt/cursor/hook.py && mkdir -p /opt/cursor/workspaces
+ENV HOOK_PORT=9000
+ENTRYPOINT ["python3", "/opt/cursor/hook.py"]

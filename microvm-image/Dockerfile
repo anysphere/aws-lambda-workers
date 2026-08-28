@@ -1,5 +1,8 @@
 ARG BASE_IMAGE=public.ecr.aws/lambda/microvms:al2023-minimal
 FROM ${BASE_IMAGE}
+# To FROM a private ECR application image instead, see Dockerfile.ecr and the
+# README section "Bring your own ECR image". --base-image-arn stays a
+# Lambda-managed OS from list-managed-microvm-images.
 
 RUN dnf install -y --setopt=install_weak_deps=0 \
       bash tar gzip git ca-certificates findutils awscli python3 \

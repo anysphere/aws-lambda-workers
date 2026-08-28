@@ -96,7 +96,7 @@ Users pick `octocat/Hello-World` in the dashboard (the pool appears under that r
 
    `https://github.com/octocat/Hello-World` (`octocat/Hello-World`) is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work. Private repos need git auth (HTTPS token or SSH) on the worker.
 
-3. Build the worker image from [`microvm-image/`](microvm-image/) (needs the stack outputs). Enable both `ready` and `validate` image hooks. After this template change, **rebuild the MicroVM image** so those hooks are in the snapshot path:
+3. Build the worker image from [`microvm-image/`](microvm-image/) (needs the stack outputs). Enable both `ready` and `validate` image hooks. After this template change, **rebuild the MicroVM image** so those hooks are in the snapshot path. The stock Dockerfile starts from `public.ecr.aws/lambda/microvms:al2023-minimal`. To start from an application image you already publish to ECR, see [Bring your own ECR image](#bring-your-own-ecr-image).
 
    ```bash
    BUCKET=$(aws cloudformation describe-stacks --stack-name cursor-lambda-workers \
@@ -116,6 +116,65 @@ Users pick `octocat/Hello-World` in the dashboard (the pool appears under that r
    ```
 
 4. Start an agent from [cursor.com/agents](https://cursor.com/agents) against the pool, or against `octocat/Hello-World` for the repo-bound walkthrough. That GitHub repo is a public sample so you can clone without configuring git credentials. Replace it with your real repository before you run real work.
+
+## Bring your own ECR image
+
+`create-microvm-image` still takes `--code-artifact uri=s3://.../app.zip` (a zip whose root contains a `Dockerfile` plus app artifacts) and `--base-image-arn` (a Lambda-managed MicroVM OS from `list-managed-microvm-images`). Your ECR image is the **container** base via `FROM` in that Dockerfile, not an argument to `--code-artifact` or `--base-image-arn`. Lambda builds the Dockerfile inside the managed OS, then snapshots the result. Official docs: [Container base images / Using a private ECR image](https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html).
+
+Keep publishing the application image from CI/CD as you already do (deps, toolchain, repo-specific packages). The MicroVM zip is thin: a Dockerfile that `FROM`s that image (tag or digest) plus this repo’s Cursor worker files. Rebuilding the MicroVM image is what picks up a new CI image. `run-microvm` still uses the MicroVM image name or ARN (`cursor-pool-worker` here), not the ECR URI.
+
+### Dockerfile
+
+Use [`microvm-image/Dockerfile.ecr`](microvm-image/Dockerfile.ecr). Set `FROM` to your image, then layer the same worker bits the stock image installs. Do not drop them: snapshot and smoke-test still POST `/ready` and `/validate` on port 9000.
+
+```dockerfile
+FROM 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-ci-image:tag
+# linux/arm64 (this template’s guests are aarch64). Linux, snapshot-compatible.
+# Image must be reachable from Lambda build (public internet or ECR in this account).
+# Ensure git, python3, curl, tar, and awscli if the CI image does not already
+# have them (package manager depends on FROM).
+
+COPY cursor-agent-version /tmp/cursor-agent-version
+# install cursor-agent for linux/arm64 (same RUN as the stock Dockerfile)
+
+COPY entrypoint.sh hook.py /opt/cursor/
+RUN chmod +x /opt/cursor/entrypoint.sh /opt/cursor/hook.py && mkdir -p /opt/cursor/workspaces
+ENV HOOK_PORT=9000
+ENTRYPOINT ["python3", "/opt/cursor/hook.py"]
+```
+
+The guest still needs:
+
+- Cursor agent CLI (`cursor-agent` / `agent worker … start`)
+- git (repo-bound clone in [`entrypoint.sh`](microvm-image/entrypoint.sh))
+- `/run`, `/ready`, `/validate` on port 9000 ([`hook.py`](microvm-image/hook.py))
+- entrypoint that starts the worker with `CURSOR_*` on `/run`
+
+Zip `Dockerfile.ecr` as `Dockerfile` so you do not overwrite the stock quickstart:
+
+```bash
+rm -f /tmp/app.zip
+TMP=$(mktemp -d)
+cp microvm-image/entrypoint.sh microvm-image/hook.py microvm-image/cursor-agent-version "$TMP/"
+cp microvm-image/Dockerfile.ecr "$TMP/Dockerfile"
+( cd "$TMP" && zip -r /tmp/app.zip . )
+aws s3 cp /tmp/app.zip "s3://${BUCKET}/app.zip"
+```
+
+Then the same `create-microvm-image` as Deploy step 3: same `--base-image-arn` from `list-managed-microvm-images`, `--build-role-arn`, and `--hooks` with `ready` and `validate` **ENABLED**. Keep those hooks; BYO ECR does not change the snapshot path.
+
+### IAM (private ECR)
+
+The MicroVM **build role** must pull `FROM`. [`cloudformation.yaml`](cloudformation.yaml) `BuildRole` includes:
+
+- `ecr:GetAuthorizationToken` (`Resource: *` — that action does not support resource-level IAM)
+- `ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage` on this account’s ECR repositories
+
+Redeploy the stack so those statements exist before the first BYO build. Cross-account ECR needs extra policy on the role and a repository policy on the other account; this template does not add that.
+
+### Architecture
+
+This template’s MicroVM guests are **aarch64**. The ECR image must be `linux/arm64`. An amd64-only CI image fails the MicroVM build or fails at runtime (`Exec format error` on `node`). Publish an arm64 or multi-arch tag from CI.
 
 ## Run a cloud agent
 
@@ -155,6 +214,7 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 | Symptom | What to check |
 | --- | --- |
 | Image build fails (S3 or IAM) | Confirm stack outputs `ArtifactBucketName` and `BuildRoleArn`. The zip must land in that bucket, and the build role must be able to read it. |
+| Image build fails pulling `FROM` (ECR) | Do not pass an ECR URI to `--code-artifact` or `--base-image-arn`. Put the URI in the zip’s `Dockerfile` `FROM`. Redeploy so `BuildRole` can pull private ECR. Image must be Linux `linux/arm64`, snapshot-compatible, and in this account (or public). |
 | Image built before `/ready`+`/validate` | Rebuild the MicroVM image so those hooks are in the snapshot path. Existing snapshots were taken without them. |
 | No MicroVM | Confirm the controller is running and can call `run-microvm`. For a local controller, assume `SpawnRoleArn`. Confirm image `cursor-pool-worker` exists. |
 | Worker dies immediately | The guest needs `CURSOR_API_KEY` (SSM `/cursor-lambda-workers/cursor-api-key`). Confirm the `/run` hook started `cursor-agent worker --pool … start`. If logs show `Exec format error` on `node`, the image installed the wrong CLI arch (MicroVMs here are aarch64). If auth says the API key is invalid, do not set `CURSOR_API_ENDPOINT` to `https://api.cursor.com`. |
@@ -163,6 +223,7 @@ aws lambda-microvms list-microvms --image-identifier cursor-pool-worker
 ## Related resources
 
 - [AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html)
+- [MicroVM images (container base / private ECR)](https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html)
 - [Cursor self-hosted pools](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md) ([Any repo / repo-less](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#repo-less-pools), [pool names](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#pool-names), [multiple repo roots](https://cursor.com/docs/cloud-agent/self-hosted-guides/pool.md#register-multiple-repo-roots))
 - This repo: [`spawn.sh`](spawn.sh), [`cloudformation.yaml`](cloudformation.yaml), [`microvm-image/`](microvm-image/)
 
