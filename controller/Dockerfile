@@ -16,7 +16,7 @@ RUN ARCH="$( [ "${TARGETARCH}" = "arm64" ] && echo aarch64 || echo x86_64 )" && 
     curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscliv2.zip && \
     unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
 
-# Optional: pin a lab/main CLI. Empty = prod installer. Same file as the MicroVM image.
+# Empty cursor-agent-version / CURSOR_AGENT_VERSION = public installer.
 COPY microvm-image/cursor-agent-version /tmp/cursor-agent-version
 RUN VERSION="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' /tmp/cursor-agent-version | sed -e '/^$/d' | head -n 1)" && \
     VERSION="${VERSION:-${CURSOR_AGENT_VERSION:-}}" && \
