@@ -18,6 +18,7 @@ jobs:
           test -f controller/Dockerfile
           test -f controller/handler.py
           test -f microvm-image/Dockerfile
+          test -f microvm-image/Dockerfile.ecr
           test -f microvm-image/entrypoint.sh
           test -f microvm-image/hook.py
           test ! -f handler.mjs
@@ -39,3 +40,10 @@ jobs:
           grep -q 'endswith("/validate")' microvm-image/hook.py
           grep -q 'endswith("/run")' microvm-image/hook.py
           grep -q '"validate":"ENABLED"' README.md
+          grep -q "Bring your own ECR image" README.md
+          grep -q "ecr:GetAuthorizationToken" cloudformation.yaml
+          grep -q "ecr:BatchCheckLayerAvailability" cloudformation.yaml
+          grep -q "ecr:GetDownloadUrlForLayer" cloudformation.yaml
+          grep -q "ecr:BatchGetImage" cloudformation.yaml
+          grep -q "COPY entrypoint.sh hook.py" microvm-image/Dockerfile.ecr
+          grep -q 'ENTRYPOINT \["python3", "/opt/cursor/hook.py"\]' microvm-image/Dockerfile.ecr
